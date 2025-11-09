@@ -13,7 +13,6 @@ import os
 import sys
 import time
 from datetime import datetime
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -147,141 +146,51 @@ def extract_video_src_from_html(html_content: str, base_url: str) -> list[str]:
     return unique_urls
 
 
-def extract_video_url_with_playwright(url: str) -> dict:
-    """
-    Extract embedded video source URL using Playwright to render JavaScript
-    """
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            
-            # Navigate to the page and wait for content to load
-            page.goto(url, wait_until='networkidle', timeout=30000)
-            
-            # Wait a bit for videos to load
-            page.wait_for_timeout(2000)
-            
-            # Extract title
-            title = page.title() or 'Unknown'
-            
-            # Try to find video elements and extract their src
-            video_urls = []
-            
-            # Get all video elements
-            video_elements = page.query_selector_all('video')
-            for video in video_elements:
-                # Try src attribute
-                src = video.get_attribute('src')
-                if src:
-                    video_urls.append(src)
-                
-                # Try currentSrc property via JavaScript
-                current_src = page.evaluate('(video) => video.currentSrc', video)
-                if current_src and current_src not in video_urls:
-                    video_urls.append(current_src)
-                
-                # Check for source elements inside video
-                source_elements = video.query_selector_all('source')
-                for source in source_elements:
-                    source_src = source.get_attribute('src')
-                    if source_src and source_src not in video_urls:
-                        video_urls.append(source_src)
-            
-            # Also check for video URLs in the page content (rendered HTML)
-            html_content = page.content()
-            extracted_urls = extract_video_src_from_html(html_content, url)
-            video_urls.extend(extracted_urls)
-            
-            # Try to find video URLs via JavaScript evaluation
-            # Look for common video player patterns
-            js_video_urls = page.evaluate("""
-                () => {
-                    const urls = [];
-                    // Check for video elements
-                    document.querySelectorAll('video').forEach(video => {
-                        if (video.src) urls.push(video.src);
-                        if (video.currentSrc) urls.push(video.currentSrc);
-                    });
-                    // Check for common video player data attributes
-                    document.querySelectorAll('[data-video-url], [data-src], [data-video-src]').forEach(el => {
-                        const url = el.getAttribute('data-video-url') || el.getAttribute('data-src') || el.getAttribute('data-video-src');
-                        if (url && url.match(/\\.(mp4|webm|ogg|mov|avi|m3u8)/i)) urls.push(url);
-                    });
-                    return urls;
-                }
-            """)
-            if js_video_urls:
-                video_urls.extend(js_video_urls)
-            
-            browser.close()
-            
-            # Resolve relative URLs
-            resolved_urls = []
-            for video_url in video_urls:
-                if not video_url:
-                    continue
-                if video_url.startswith('http://') or video_url.startswith('https://'):
-                    resolved_urls.append(video_url)
-                elif video_url.startswith('//'):
-                    resolved_urls.append('https:' + video_url)
-                elif video_url.startswith('/'):
-                    parsed_base = urllib.parse.urlparse(url)
-                    resolved_urls.append(f"{parsed_base.scheme}://{parsed_base.netloc}{video_url}")
-                else:
-                    resolved_urls.append(urllib.parse.urljoin(url, video_url))
-            
-            # Remove duplicates
-            seen = set()
-            unique_urls = []
-            for url_item in resolved_urls:
-                if url_item and url_item not in seen:
-                    seen.add(url_item)
-                    unique_urls.append(url_item)
-            
-            if not unique_urls:
-                raise Exception("No video source URL found in rendered page")
-            
-            return {
-                'title': title,
-                'video_url': unique_urls[0],
-                'success': True
-            }
-            
-    except PlaywrightTimeoutError as e:
-        error_msg = f"Timeout waiting for page to load: {str(e)}"
-        logger.error(error_msg)
-        raise TranscriptionError(408, "Request timeout: Page took too long to load", error_msg)
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error extracting video URL with Playwright: {error_msg}")
-        raise
-
-
 def extract_video_url(url: str) -> dict:
     """
     Extract embedded video source URL using yt-dlp (designed for this purpose)
     """
     try:
-        # First, try yt-dlp - it's specifically designed to extract video URLs from platforms
-        logger.info("Attempting to extract video URL with yt-dlp")
+        logger.info(f"Extracting video URL with yt-dlp for: {url}")
         ydl_opts = {
             'skip_download': True,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,  # Enable logging to see what's happening
+            'no_warnings': False,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info("Calling yt-dlp extract_info...")
             info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Unknown')
             
+            # Log what we got from yt-dlp
+            logger.info(f"yt-dlp extracted info keys: {list(info.keys())}")
+            logger.info(f"Title: {info.get('title', 'N/A')}")
+            logger.info(f"Extractor: {info.get('extractor', 'N/A')}")
+            logger.info(f"Has 'url' key: {'url' in info}")
+            logger.info(f"Has 'formats' key: {'formats' in info}")
+            
+            title = info.get('title', 'Unknown')
             video_url = None
+            
+            # Log direct URL if available
+            if 'url' in info:
+                direct_url = info['url']
+                logger.info(f"Direct URL found: {direct_url[:100]}..." if len(direct_url) > 100 else f"Direct URL found: {direct_url}")
+                video_url = direct_url
             
             # Try to get the best video URL from formats
             if 'formats' in info:
                 formats = info['formats']
+                logger.info(f"Found {len(formats)} format(s)")
+                
+                # Log format details
+                for i, fmt in enumerate(formats[:5]):  # Log first 5 formats
+                    logger.info(f"Format {i}: vcodec={fmt.get('vcodec', 'N/A')}, acodec={fmt.get('acodec', 'N/A')}, "
+                              f"height={fmt.get('height', 'N/A')}, has_url={bool(fmt.get('url'))}")
+                
                 # Prefer video formats (not audio-only)
                 video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
+                logger.info(f"Found {len(video_formats)} video format(s) (non-audio-only)")
                 
                 if video_formats:
                     # Sort by quality/bitrate and get the best one
@@ -291,39 +200,35 @@ def extract_video_url(url: str) -> dict:
                         x.get('filesize', 0) or 0
                     ), reverse=True)
                     video_url = video_formats[0]['url']
+                    logger.info(f"Selected best video format URL: {video_url[:100]}..." if len(video_url) > 100 else f"Selected best video format URL: {video_url}")
                 elif formats:
                     # Fallback to any format with a URL
                     for fmt in formats:
                         if fmt.get('url'):
                             video_url = fmt['url']
+                            logger.info(f"Using fallback format URL: {video_url[:100]}..." if len(video_url) > 100 else f"Using fallback format URL: {video_url}")
                             break
             
-            # If no format URL, try direct URL
-            if not video_url and 'url' in info:
-                video_url = info['url']
-            
+            # Log what we're returning
             if video_url:
+                logger.info(f"Successfully extracted video URL: {video_url[:100]}..." if len(video_url) > 100 else f"Successfully extracted video URL: {video_url}")
                 return {
                     'title': title,
                     'video_url': video_url,
                     'success': True
                 }
             else:
+                # Log the full info structure to help debug
+                logger.error(f"No video URL found. Info structure: {json.dumps({k: str(v)[:200] for k, v in list(info.items())[:10]}, indent=2)}")
                 raise Exception("No video URL found in yt-dlp info")
                 
-    except Exception as ytdlp_error:
-        error_msg = str(ytdlp_error)
-        logger.warning(f"yt-dlp extraction failed: {error_msg}, trying Playwright fallback")
-        
-        # Fallback to Playwright if yt-dlp fails
-        try:
-            return extract_video_url_with_playwright(url)
-        except Exception as playwright_error:
-            logger.warning(f"Playwright extraction also failed: {str(playwright_error)}")
-            # Re-raise the original yt-dlp error with proper classification
-            status_code, message = classify_error(ytdlp_error)
-            logger.info(f"Classified error as {status_code}: {message}")
-            raise TranscriptionError(status_code, message, error_msg)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"yt-dlp extraction failed: {error_msg}")
+        logger.error(f"Error type: {type(e).__name__}")
+        status_code, message = classify_error(e)
+        logger.info(f"Classified error as {status_code}: {message}")
+        raise TranscriptionError(status_code, message, error_msg)
 
 
 def parse_vtt(vtt_content: str) -> str:

@@ -3,5 +3,4 @@ uvicorn[standard]==0.24.0
 yt-dlp>=2024.11.7
 pydantic==2.5.0
 pydantic[email]==2.5.0
-playwright==1.40.0
 
