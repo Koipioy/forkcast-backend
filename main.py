@@ -60,8 +60,9 @@ def classify_error(error: Exception) -> tuple[int, str]:
     Classify yt-dlp errors and return appropriate HTTP status code and message
     """
     error_str = str(error).lower()
+    original_error = str(error)
     
-    # 403 Forbidden - Access denied
+    # 403 Forbidden - Access denied (check this first as it's most specific)
     if '403' in error_str or 'forbidden' in error_str:
         return 403, "Access denied: The video source is blocking access to this content"
     
@@ -77,16 +78,17 @@ def classify_error(error: Exception) -> tuple[int, str]:
     if 'timeout' in error_str or 'connection' in error_str or 'network' in error_str:
         return 503, "Service unavailable: Network error while accessing the video source"
     
-    # Unsupported URL/format
-    if 'unsupported url' in error_str or 'no video formats found' in error_str or 'unable to extract' in error_str:
-        return 400, f"Bad request: {str(error)}"
+    # Unsupported URL/format or unable to download/extract
+    if ('unsupported url' in error_str or 'no video formats found' in error_str or 
+        'unable to extract' in error_str or 'unable to download' in error_str):
+        return 400, f"Bad request: Unable to process this video URL"
     
     # No subtitles found
     if 'no english subtitles' in error_str or 'no subtitles' in error_str:
         return 400, "No subtitles available: This video does not have English subtitles"
     
     # Default to 500 for unexpected errors
-    return 500, f"Internal server error: {str(error)}"
+    return 500, f"Internal server error: {original_error}"
 
 
 def extract_transcription(url: str) -> dict:
@@ -169,10 +171,12 @@ def extract_transcription(url: str) -> dict:
                 raise Exception("No English subtitles found for this video")
                 
         except Exception as e:
-            logger.error(f"Error extracting transcription: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Error extracting transcription: {error_msg}")
             # Re-raise with error classification info attached
             status_code, message = classify_error(e)
-            raise TranscriptionError(status_code, message, str(e))
+            logger.info(f"Classified error as {status_code}: {message}")
+            raise TranscriptionError(status_code, message, error_msg)
 
 
 def parse_vtt(vtt_content: str) -> str:
