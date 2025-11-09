@@ -5,6 +5,8 @@ import yt_dlp
 import json
 import logging
 import urllib.request
+import urllib.parse
+import urllib.error
 import re
 import tempfile
 import os
@@ -91,67 +93,134 @@ def classify_error(error: Exception) -> tuple[int, str]:
     return 500, f"Internal server error: {original_error}"
 
 
+def extract_video_src_from_html(html_content: str, base_url: str) -> list[str]:
+    """
+    Extract video src URLs from HTML content
+    """
+    video_urls = []
+    
+    # Find <video> tags with src attribute
+    video_src_pattern = r'<video[^>]+src=["\']([^"\']+)["\']'
+    matches = re.findall(video_src_pattern, html_content, re.IGNORECASE)
+    video_urls.extend(matches)
+    
+    # Find <video> tags with <source> elements
+    source_pattern = r'<source[^>]+src=["\']([^"\']+)["\']'
+    matches = re.findall(source_pattern, html_content, re.IGNORECASE)
+    video_urls.extend(matches)
+    
+    # Find video URLs in data attributes (common in modern web apps)
+    data_src_pattern = r'data-src=["\']([^"\']+\.(?:mp4|webm|ogg|mov|avi|m3u8))["\']'
+    matches = re.findall(data_src_pattern, html_content, re.IGNORECASE)
+    video_urls.extend(matches)
+    
+    # Find video URLs in JSON/JavaScript (common for embedded players)
+    json_video_pattern = r'["\'](https?://[^"\']+\.(?:mp4|webm|ogg|mov|avi|m3u8))["\']'
+    json_matches = re.findall(json_video_pattern, html_content, re.IGNORECASE)
+    video_urls.extend(json_matches)
+    
+    # Resolve relative URLs to absolute
+    resolved_urls = []
+    for video_url in video_urls:
+        if video_url.startswith('http://') or video_url.startswith('https://'):
+            resolved_urls.append(video_url)
+        elif video_url.startswith('//'):
+            resolved_urls.append('https:' + video_url)
+        elif video_url.startswith('/'):
+            parsed_base = urllib.parse.urlparse(base_url)
+            resolved_urls.append(f"{parsed_base.scheme}://{parsed_base.netloc}{video_url}")
+        else:
+            # Relative URL
+            resolved_urls.append(urllib.parse.urljoin(base_url, video_url))
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_urls = []
+    for url in resolved_urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+    
+    return unique_urls
+
+
 def extract_video_url(url: str) -> dict:
     """
-    Extract video source URL from a video URL using yt-dlp
+    Extract embedded video source URL from a webpage
     """
-    ydl_opts = {
-        'skip_download': True,
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Get video info
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Unknown')
-            
-            # Try to get the best video URL
-            video_url = None
-            
-            # First, try to get direct URL if available
-            if 'url' in info:
-                video_url = info['url']
-            
-            # If not available, try to get from formats
-            if not video_url and 'formats' in info:
-                formats = info['formats']
-                # Prefer video formats (not audio-only)
-                video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
-                
-                if video_formats:
-                    # Sort by quality/bitrate and get the best one
-                    video_formats.sort(key=lambda x: (
-                        x.get('height', 0) or 0,
-                        x.get('tbr', 0) or 0,
-                        x.get('filesize', 0) or 0
-                    ), reverse=True)
-                    video_url = video_formats[0]['url']
-                elif formats:
-                    # Fallback to any format with a URL
-                    for fmt in formats:
-                        if fmt.get('url'):
-                            video_url = fmt['url']
-                            break
-            
-            # If still no URL, try requestor_url or webpage_url
-            if not video_url:
-                video_url = info.get('requested_url') or info.get('webpage_url') or url
-            
-            if not video_url:
-                raise Exception("No video URL found")
-            
-            return {
-                'title': title,
-                'video_url': video_url,
-                'success': True
+        # First, try to fetch the HTML page
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
+        )
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html_content = response.read().decode('utf-8', errors='ignore')
+        
+        # Extract title from HTML
+        title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
+        title = title_match.group(1).strip() if title_match else 'Unknown'
+        
+        # Extract video src URLs from HTML
+        video_urls = extract_video_src_from_html(html_content, url)
+        
+        if not video_urls:
+            # Fallback: try using yt-dlp to extract video info
+            logger.info("No video src found in HTML, trying yt-dlp as fallback")
+            ydl_opts = {
+                'skip_download': True,
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', title)
                 
+                # Try to get video URL from formats
+                if 'formats' in info:
+                    formats = info['formats']
+                    video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
+                    
+                    if video_formats:
+                        video_formats.sort(key=lambda x: (
+                            x.get('height', 0) or 0,
+                            x.get('tbr', 0) or 0,
+                            x.get('filesize', 0) or 0
+                        ), reverse=True)
+                        video_urls = [video_formats[0]['url']]
+                    elif formats:
+                        for fmt in formats:
+                            if fmt.get('url'):
+                                video_urls = [fmt['url']]
+                                break
+        
+        if not video_urls:
+            raise Exception("No video source URL found in page")
+        
+        # Return the first (best) video URL
+        return {
+            'title': title,
+            'video_url': video_urls[0],
+            'success': True
+        }
+                
+    except urllib.error.HTTPError as e:
+        error_msg = f"HTTP Error {e.code}: {e.reason}"
+        logger.error(f"Error fetching page: {error_msg}")
+        status_code, message = classify_error(e)
+        raise TranscriptionError(status_code, message, error_msg)
+    except urllib.error.URLError as e:
+        error_msg = f"URL Error: {str(e)}"
+        logger.error(f"Error fetching page: {error_msg}")
+        status_code, message = classify_error(e)
+        raise TranscriptionError(status_code, message, error_msg)
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error extracting video URL: {error_msg}")
-        # Re-raise with error classification info attached
         status_code, message = classify_error(e)
         logger.info(f"Classified error as {status_code}: {message}")
         raise TranscriptionError(status_code, message, error_msg)
