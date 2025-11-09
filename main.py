@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -77,7 +78,9 @@ def classify_error(error: Exception) -> tuple[int, str]:
         return 401, "Unauthorized: Authentication required to access this content"
     
     # Network/timeout errors
-    if 'timeout' in error_str or 'connection' in error_str or 'network' in error_str:
+    if 'timeout' in error_str or 'took too long' in error_str:
+        return 408, "Request timeout: Page took too long to load"
+    if 'connection' in error_str or 'network' in error_str:
         return 503, "Service unavailable: Network error while accessing the video source"
     
     # Unsupported URL/format or unable to download/extract
@@ -144,12 +147,130 @@ def extract_video_src_from_html(html_content: str, base_url: str) -> list[str]:
     return unique_urls
 
 
+def extract_video_url_with_playwright(url: str) -> dict:
+    """
+    Extract embedded video source URL using Playwright to render JavaScript
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            # Navigate to the page and wait for content to load
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            
+            # Wait a bit for videos to load
+            page.wait_for_timeout(2000)
+            
+            # Extract title
+            title = page.title() or 'Unknown'
+            
+            # Try to find video elements and extract their src
+            video_urls = []
+            
+            # Get all video elements
+            video_elements = page.query_selector_all('video')
+            for video in video_elements:
+                # Try src attribute
+                src = video.get_attribute('src')
+                if src:
+                    video_urls.append(src)
+                
+                # Try currentSrc property via JavaScript
+                current_src = page.evaluate('(video) => video.currentSrc', video)
+                if current_src and current_src not in video_urls:
+                    video_urls.append(current_src)
+                
+                # Check for source elements inside video
+                source_elements = video.query_selector_all('source')
+                for source in source_elements:
+                    source_src = source.get_attribute('src')
+                    if source_src and source_src not in video_urls:
+                        video_urls.append(source_src)
+            
+            # Also check for video URLs in the page content (rendered HTML)
+            html_content = page.content()
+            extracted_urls = extract_video_src_from_html(html_content, url)
+            video_urls.extend(extracted_urls)
+            
+            # Try to find video URLs via JavaScript evaluation
+            # Look for common video player patterns
+            js_video_urls = page.evaluate("""
+                () => {
+                    const urls = [];
+                    // Check for video elements
+                    document.querySelectorAll('video').forEach(video => {
+                        if (video.src) urls.push(video.src);
+                        if (video.currentSrc) urls.push(video.currentSrc);
+                    });
+                    // Check for common video player data attributes
+                    document.querySelectorAll('[data-video-url], [data-src], [data-video-src]').forEach(el => {
+                        const url = el.getAttribute('data-video-url') || el.getAttribute('data-src') || el.getAttribute('data-video-src');
+                        if (url && url.match(/\\.(mp4|webm|ogg|mov|avi|m3u8)/i)) urls.push(url);
+                    });
+                    return urls;
+                }
+            """)
+            if js_video_urls:
+                video_urls.extend(js_video_urls)
+            
+            browser.close()
+            
+            # Resolve relative URLs
+            resolved_urls = []
+            for video_url in video_urls:
+                if not video_url:
+                    continue
+                if video_url.startswith('http://') or video_url.startswith('https://'):
+                    resolved_urls.append(video_url)
+                elif video_url.startswith('//'):
+                    resolved_urls.append('https:' + video_url)
+                elif video_url.startswith('/'):
+                    parsed_base = urllib.parse.urlparse(url)
+                    resolved_urls.append(f"{parsed_base.scheme}://{parsed_base.netloc}{video_url}")
+                else:
+                    resolved_urls.append(urllib.parse.urljoin(url, video_url))
+            
+            # Remove duplicates
+            seen = set()
+            unique_urls = []
+            for url_item in resolved_urls:
+                if url_item and url_item not in seen:
+                    seen.add(url_item)
+                    unique_urls.append(url_item)
+            
+            if not unique_urls:
+                raise Exception("No video source URL found in rendered page")
+            
+            return {
+                'title': title,
+                'video_url': unique_urls[0],
+                'success': True
+            }
+            
+    except PlaywrightTimeoutError as e:
+        error_msg = f"Timeout waiting for page to load: {str(e)}"
+        logger.error(error_msg)
+        raise TranscriptionError(408, "Request timeout: Page took too long to load", error_msg)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error extracting video URL with Playwright: {error_msg}")
+        raise
+
+
 def extract_video_url(url: str) -> dict:
     """
     Extract embedded video source URL from a webpage
     """
     try:
-        # First, try to fetch the HTML page
+        # First try with Playwright to render JavaScript
+        logger.info("Attempting to extract video URL with Playwright")
+        try:
+            return extract_video_url_with_playwright(url)
+        except Exception as playwright_error:
+            logger.warning(f"Playwright extraction failed: {str(playwright_error)}, trying fallback methods")
+        
+        # Fallback 1: Try simple HTML fetch
         req = urllib.request.Request(
             url,
             headers={
@@ -167,8 +288,8 @@ def extract_video_url(url: str) -> dict:
         # Extract video src URLs from HTML
         video_urls = extract_video_src_from_html(html_content, url)
         
+        # Fallback 2: Try using yt-dlp
         if not video_urls:
-            # Fallback: try using yt-dlp to extract video info
             logger.info("No video src found in HTML, trying yt-dlp as fallback")
             ydl_opts = {
                 'skip_download': True,
