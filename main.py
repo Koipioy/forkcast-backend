@@ -21,7 +21,7 @@ start_time = time.time()
 
 app = FastAPI(
     title="Forkcast Backend",
-    description="API for video transcription using yt-dlp",
+    description="API for video URL extraction using yt-dlp",
     version="1.0.0"
 )
 
@@ -42,7 +42,7 @@ class VideoRequest(BaseModel):
 class TranscriptionResponse(BaseModel):
     url: str
     title: str
-    transcription: str
+    video_url: str
     success: bool
 
 
@@ -83,100 +83,78 @@ def classify_error(error: Exception) -> tuple[int, str]:
         'unable to extract' in error_str or 'unable to download' in error_str):
         return 400, f"Bad request: Unable to process this video URL"
     
-    # No subtitles found
-    if 'no english subtitles' in error_str or 'no subtitles' in error_str:
-        return 400, "No subtitles available: This video does not have English subtitles"
+    # No video URL found
+    if 'no video url found' in error_str or 'no video' in error_str:
+        return 400, "No video URL available: Unable to extract video source URL"
     
     # Default to 500 for unexpected errors
     return 500, f"Internal server error: {original_error}"
 
 
-def extract_transcription(url: str) -> dict:
+def extract_video_url(url: str) -> dict:
     """
-    Extract transcription from a video URL using yt-dlp
+    Extract video source URL from a video URL using yt-dlp
     """
-    # Create a temporary directory for subtitle files
-    with tempfile.TemporaryDirectory() as temp_dir:
-        ydl_opts = {
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': ['en', 'en-US', 'en-GB'],
-            'subtitlesformat': 'vtt',
-            'skip_download': True,
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Get video info and download subtitles
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'Unknown')
+    ydl_opts = {
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Get video info
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'Unknown')
+            
+            # Try to get the best video URL
+            video_url = None
+            
+            # First, try to get direct URL if available
+            if 'url' in info:
+                video_url = info['url']
+            
+            # If not available, try to get from formats
+            if not video_url and 'formats' in info:
+                formats = info['formats']
+                # Prefer video formats (not audio-only)
+                video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
                 
-                # Look for downloaded subtitle files
-                subtitle_files = []
-                for file in os.listdir(temp_dir):
-                    if file.endswith('.en.vtt') or file.endswith('.en-US.vtt') or file.endswith('.en-GB.vtt'):
-                        subtitle_files.append(os.path.join(temp_dir, file))
+                if video_formats:
+                    # Sort by quality/bitrate and get the best one
+                    video_formats.sort(key=lambda x: (
+                        x.get('height', 0) or 0,
+                        x.get('tbr', 0) or 0,
+                        x.get('filesize', 0) or 0
+                    ), reverse=True)
+                    video_url = video_formats[0]['url']
+                elif formats:
+                    # Fallback to any format with a URL
+                    for fmt in formats:
+                        if fmt.get('url'):
+                            video_url = fmt['url']
+                            break
+            
+            # If still no URL, try requestor_url or webpage_url
+            if not video_url:
+                video_url = info.get('requested_url') or info.get('webpage_url') or url
+            
+            if not video_url:
+                raise Exception("No video URL found")
+            
+            return {
+                'title': title,
+                'video_url': video_url,
+                'success': True
+            }
                 
-                # If no files downloaded, try URL-based extraction
-                if not subtitle_files:
-                    subtitles = info.get('subtitles', {})
-                    automatic_captions = info.get('automatic_captions', {})
-                    all_subtitles = {**subtitles, **automatic_captions}
-                    
-                    for lang in ['en', 'en-US', 'en-GB']:
-                        if lang in all_subtitles:
-                            formats = all_subtitles[lang]
-                            if formats:
-                                # Prefer vtt format
-                                preferred_format = None
-                                for fmt in ['vtt', 'ttml', 'srv3', 'srv2', 'srv1']:
-                                    if fmt in formats:
-                                        preferred_format = fmt
-                                        break
-                                
-                                if not preferred_format:
-                                    preferred_format = list(formats.keys())[0]
-                                
-                                subtitle_url = formats[preferred_format]['url']
-                                subtitle_content = urllib.request.urlopen(subtitle_url).read().decode('utf-8')
-                                
-                                if preferred_format == 'vtt':
-                                    subtitle_data = parse_vtt(subtitle_content)
-                                else:
-                                    subtitle_data = subtitle_content
-                                
-                                return {
-                                    'title': title,
-                                    'transcription': subtitle_data,
-                                    'success': True
-                                }
-                
-                # Read from downloaded files
-                if subtitle_files:
-                    # Use the first available subtitle file
-                    with open(subtitle_files[0], 'r', encoding='utf-8') as f:
-                        subtitle_content = f.read()
-                    
-                    subtitle_data = parse_vtt(subtitle_content)
-                    
-                    return {
-                        'title': title,
-                        'transcription': subtitle_data,
-                        'success': True
-                    }
-                
-                raise Exception("No English subtitles found for this video")
-                
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Error extracting transcription: {error_msg}")
-            # Re-raise with error classification info attached
-            status_code, message = classify_error(e)
-            logger.info(f"Classified error as {status_code}: {message}")
-            raise TranscriptionError(status_code, message, error_msg)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error extracting video URL: {error_msg}")
+        # Re-raise with error classification info attached
+        status_code, message = classify_error(e)
+        logger.info(f"Classified error as {status_code}: {message}")
+        raise TranscriptionError(status_code, message, error_msg)
 
 
 def parse_vtt(vtt_content: str) -> str:
@@ -209,7 +187,7 @@ async def root():
         "message": "Forkcast Backend API",
         "endpoints": {
             "GET /": "This message",
-            "POST /transcribe": "Get video transcription",
+            "POST /transcribe": "Extract video source URL",
             "GET /health": "Health check",
             "GET /status": "Detailed status information"
         }
@@ -286,18 +264,18 @@ async def status():
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_video(request: VideoRequest):
     """
-    Transcribe a video from a URL using yt-dlp
+    Extract video source URL from a video URL using yt-dlp
     """
     try:
         url_str = str(request.url)
-        logger.info(f"Processing transcription request for: {url_str}")
+        logger.info(f"Processing video extraction request for: {url_str}")
         
-        result = extract_transcription(url_str)
+        result = extract_video_url(url_str)
         
         return TranscriptionResponse(
             url=url_str,
             title=result['title'],
-            transcription=result['transcription'],
+            video_url=result['video_url'],
             success=True
         )
         
