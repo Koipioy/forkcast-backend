@@ -149,44 +149,78 @@ def extract_video_src_from_html(html_content: str, base_url: str) -> list[str]:
 def extract_video_url(url: str) -> dict:
     """
     Extract embedded video source URL using yt-dlp (designed for this purpose)
+    
+    yt-dlp usage methods:
+    1. extract_info(url, download=False) - Returns full metadata dict
+    2. extract_info(url, download=True) - Downloads and returns metadata
+    3. Options control what gets extracted (formats, subtitles, etc.)
+    
+    The info dict can contain:
+    - 'url': Direct video URL (for single format videos)
+    - 'formats': List of available formats with URLs
+    - 'requested_formats': Combined video+audio formats
+    - 'fragments': For HLS/DASH streams
     """
     try:
         logger.info(f"Extracting video URL with yt-dlp for: {url}")
+        
+        # Try different yt-dlp options that might work better for Pinterest
         ydl_opts = {
             'skip_download': True,
             'quiet': False,  # Enable logging to see what's happening
             'no_warnings': False,
+            # Try to get the best format
+            'format': 'bestvideo+bestaudio/best',  # Prefer best quality
+            # Don't merge formats, just get URLs
+            'noplaylist': True,
+            # Extract flat playlist if it's a playlist
+            'extract_flat': False,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info("Calling yt-dlp extract_info...")
+            logger.info("Calling yt-dlp extract_info with download=False...")
             info = ydl.extract_info(url, download=False)
             
             # Log what we got from yt-dlp
             logger.info(f"yt-dlp extracted info keys: {list(info.keys())}")
             logger.info(f"Title: {info.get('title', 'N/A')}")
             logger.info(f"Extractor: {info.get('extractor', 'N/A')}")
+            logger.info(f"Extractor key: {info.get('extractor_key', 'N/A')}")
             logger.info(f"Has 'url' key: {'url' in info}")
             logger.info(f"Has 'formats' key: {'formats' in info}")
+            logger.info(f"Has 'requested_formats' key: {'requested_formats' in info}")
+            logger.info(f"Has 'fragments' key: {'fragments' in info}")
             
             title = info.get('title', 'Unknown')
             video_url = None
             
-            # Log direct URL if available
+            # Method 1: Check for direct URL (single format videos)
             if 'url' in info:
                 direct_url = info['url']
                 logger.info(f"Direct URL found: {direct_url[:100]}..." if len(direct_url) > 100 else f"Direct URL found: {direct_url}")
                 video_url = direct_url
             
-            # Try to get the best video URL from formats
-            if 'formats' in info:
+            # Method 2: Check requested_formats (combined video+audio)
+            if not video_url and 'requested_formats' in info:
+                requested = info['requested_formats']
+                logger.info(f"Found {len(requested)} requested format(s)")
+                # Get video format (not audio)
+                for fmt in requested:
+                    if fmt.get('vcodec') != 'none' and fmt.get('url'):
+                        video_url = fmt['url']
+                        logger.info(f"Using requested format URL: {video_url[:100]}..." if len(video_url) > 100 else f"Using requested format URL: {video_url}")
+                        break
+            
+            # Method 3: Check formats list (multiple quality options)
+            if not video_url and 'formats' in info:
                 formats = info['formats']
                 logger.info(f"Found {len(formats)} format(s)")
                 
                 # Log format details
                 for i, fmt in enumerate(formats[:5]):  # Log first 5 formats
-                    logger.info(f"Format {i}: vcodec={fmt.get('vcodec', 'N/A')}, acodec={fmt.get('acodec', 'N/A')}, "
-                              f"height={fmt.get('height', 'N/A')}, has_url={bool(fmt.get('url'))}")
+                    logger.info(f"Format {i}: id={fmt.get('format_id', 'N/A')}, vcodec={fmt.get('vcodec', 'N/A')}, "
+                              f"acodec={fmt.get('acodec', 'N/A')}, height={fmt.get('height', 'N/A')}, "
+                              f"has_url={bool(fmt.get('url'))}, ext={fmt.get('ext', 'N/A')}")
                 
                 # Prefer video formats (not audio-only)
                 video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
@@ -209,6 +243,19 @@ def extract_video_url(url: str) -> dict:
                             logger.info(f"Using fallback format URL: {video_url[:100]}..." if len(video_url) > 100 else f"Using fallback format URL: {video_url}")
                             break
             
+            # Method 4: Check for fragments (HLS/DASH streams)
+            if not video_url and 'fragments' in info:
+                fragments = info['fragments']
+                logger.info(f"Found {len(fragments)} fragment(s) - this is a streaming format")
+                # For fragments, we might need to construct the playlist URL
+                if fragments and len(fragments) > 0:
+                    # Try to get the base URL
+                    base_url = info.get('url') or info.get('fragment_base_url')
+                    if base_url:
+                        logger.info(f"Fragment base URL: {base_url[:100]}...")
+                        # For HLS, the URL might be in the manifest
+                        video_url = base_url
+            
             # Log what we're returning
             if video_url:
                 logger.info(f"Successfully extracted video URL: {video_url[:100]}..." if len(video_url) > 100 else f"Successfully extracted video URL: {video_url}")
@@ -219,7 +266,8 @@ def extract_video_url(url: str) -> dict:
                 }
             else:
                 # Log the full info structure to help debug
-                logger.error(f"No video URL found. Info structure: {json.dumps({k: str(v)[:200] for k, v in list(info.items())[:10]}, indent=2)}")
+                logger.error(f"No video URL found. Available keys: {list(info.keys())}")
+                logger.error(f"Sample info (first 10 items): {json.dumps({k: str(v)[:200] if not isinstance(v, (dict, list)) else type(v).__name__ for k, v in list(info.items())[:10]}, indent=2)}")
                 raise Exception("No video URL found in yt-dlp info")
                 
     except Exception as e:
