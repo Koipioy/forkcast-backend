@@ -46,6 +46,49 @@ class TranscriptionResponse(BaseModel):
     success: bool
 
 
+class TranscriptionError(Exception):
+    """Custom exception for transcription errors with HTTP status code"""
+    def __init__(self, status_code: int, message: str, original_error: str = None):
+        self.status_code = status_code
+        self.message = message
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+def classify_error(error: Exception) -> tuple[int, str]:
+    """
+    Classify yt-dlp errors and return appropriate HTTP status code and message
+    """
+    error_str = str(error).lower()
+    
+    # 403 Forbidden - Access denied
+    if '403' in error_str or 'forbidden' in error_str:
+        return 403, "Access denied: The video source is blocking access to this content"
+    
+    # 404 Not Found - Video doesn't exist
+    if '404' in error_str or 'not found' in error_str or 'does not exist' in error_str:
+        return 404, "Video not found: The requested video could not be found"
+    
+    # 401 Unauthorized
+    if '401' in error_str or 'unauthorized' in error_str:
+        return 401, "Unauthorized: Authentication required to access this content"
+    
+    # Network/timeout errors
+    if 'timeout' in error_str or 'connection' in error_str or 'network' in error_str:
+        return 503, "Service unavailable: Network error while accessing the video source"
+    
+    # Unsupported URL/format
+    if 'unsupported url' in error_str or 'no video formats found' in error_str or 'unable to extract' in error_str:
+        return 400, f"Bad request: {str(error)}"
+    
+    # No subtitles found
+    if 'no english subtitles' in error_str or 'no subtitles' in error_str:
+        return 400, "No subtitles available: This video does not have English subtitles"
+    
+    # Default to 500 for unexpected errors
+    return 500, f"Internal server error: {str(error)}"
+
+
 def extract_transcription(url: str) -> dict:
     """
     Extract transcription from a video URL using yt-dlp
@@ -127,7 +170,9 @@ def extract_transcription(url: str) -> dict:
                 
         except Exception as e:
             logger.error(f"Error extracting transcription: {str(e)}")
-            raise
+            # Re-raise with error classification info attached
+            status_code, message = classify_error(e)
+            raise TranscriptionError(status_code, message, str(e))
 
 
 def parse_vtt(vtt_content: str) -> str:
@@ -252,10 +297,18 @@ async def transcribe_video(request: VideoRequest):
             success=True
         )
         
-    except Exception as e:
-        logger.error(f"Transcription failed: {str(e)}")
+    except TranscriptionError as e:
+        logger.error(f"Transcription failed ({e.status_code}): {e.message}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to extract transcription: {str(e)}"
+            status_code=e.status_code,
+            detail=e.message
+        )
+    except Exception as e:
+        # Fallback for unexpected errors
+        status_code, detail = classify_error(e)
+        logger.error(f"Transcription failed ({status_code}): {detail}")
+        raise HTTPException(
+            status_code=status_code,
+            detail=detail
         )
 
