@@ -187,6 +187,7 @@ def extract_video_url(url: str) -> dict:
             logger.info(f"Extractor: {info.get('extractor', 'N/A')}")
             logger.info(f"Extractor key: {info.get('extractor_key', 'N/A')}")
             logger.info(f"Has 'url' key: {'url' in info}")
+            logger.info(f"Has 'urls' key: {'urls' in info}")
             logger.info(f"Has 'formats' key: {'formats' in info}")
             logger.info(f"Has 'requested_formats' key: {'requested_formats' in info}")
             logger.info(f"Has 'fragments' key: {'fragments' in info}")
@@ -194,8 +195,20 @@ def extract_video_url(url: str) -> dict:
             title = info.get('title', 'Unknown')
             video_url = None
             
+            # Method 0: Check for 'urls' field (equivalent to --get-url / --print urls)
+            # This is the most direct way yt-dlp provides URLs
+            if 'urls' in info:
+                urls = info['urls']
+                logger.info(f"Found 'urls' field with {len(urls) if isinstance(urls, list) else 'non-list'} URL(s)")
+                if isinstance(urls, list) and len(urls) > 0:
+                    video_url = urls[0]  # Get first URL
+                    logger.info(f"Using URL from 'urls' field: {video_url[:100]}..." if len(video_url) > 100 else f"Using URL from 'urls' field: {video_url}")
+                elif urls:
+                    video_url = urls
+                    logger.info(f"Using URL from 'urls' field: {video_url[:100]}..." if len(str(video_url)) > 100 else f"Using URL from 'urls' field: {video_url}")
+            
             # Method 1: Check for direct URL (single format videos)
-            if 'url' in info:
+            if not video_url and 'url' in info:
                 direct_url = info['url']
                 logger.info(f"Direct URL found: {direct_url[:100]}..." if len(direct_url) > 100 else f"Direct URL found: {direct_url}")
                 video_url = direct_url
