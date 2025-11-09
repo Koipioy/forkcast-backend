@@ -34,6 +34,44 @@ Get transcription of a video from a URL.
 ### `GET /health`
 Health check endpoint.
 
+**Response:**
+```json
+{
+  "status": "healthy"
+}
+```
+
+### `GET /status`
+Get detailed status information about the API service.
+
+**Response:**
+```json
+{
+  "status": "operational",
+  "service": "Forkcast Backend API",
+  "version": "1.0.0",
+  "timestamp": "2024-01-01T00:00:00Z",
+  "uptime": {
+    "seconds": 3600,
+    "formatted": "1h 0m 0s"
+  },
+  "dependencies": {
+    "yt-dlp": {
+      "status": "available",
+      "version": "2023.11.16"
+    },
+    "python": {
+      "version": "3.11.0"
+    }
+  },
+  "endpoints": {
+    "transcribe": "/transcribe",
+    "health": "/health",
+    "status": "/status"
+  }
+}
+```
+
 ### `GET /`
 API information and available endpoints.
 

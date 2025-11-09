@@ -8,10 +8,16 @@ import urllib.request
 import re
 import tempfile
 import os
+import sys
+import time
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Track startup time for uptime calculation
+start_time = time.time()
 
 app = FastAPI(
     title="Forkcast Backend",
@@ -155,7 +161,8 @@ async def root():
         "endpoints": {
             "GET /": "This message",
             "POST /transcribe": "Get video transcription",
-            "GET /health": "Health check"
+            "GET /health": "Health check",
+            "GET /status": "Detailed status information"
         }
     }
 
@@ -163,6 +170,68 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/status")
+async def status():
+    """
+    Get detailed status information about the API service
+    """
+    try:
+        # Calculate uptime
+        uptime_seconds = int(time.time() - start_time)
+        uptime_hours = uptime_seconds // 3600
+        uptime_minutes = (uptime_seconds % 3600) // 60
+        uptime_secs = uptime_seconds % 60
+        
+        # Check yt-dlp availability
+        yt_dlp_status = "available"
+        yt_dlp_version = "unknown"
+        try:
+            yt_dlp_version = yt_dlp.version.__version__
+        except:
+            try:
+                import subprocess
+                result = subprocess.run(['yt-dlp', '--version'], 
+                                      capture_output=True, 
+                                      text=True, 
+                                      timeout=5)
+                if result.returncode == 0:
+                    yt_dlp_version = result.stdout.strip()
+            except:
+                yt_dlp_status = "unavailable"
+        
+        return {
+            "status": "operational",
+            "service": "Forkcast Backend API",
+            "version": "1.0.0",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "uptime": {
+                "seconds": uptime_seconds,
+                "formatted": f"{uptime_hours}h {uptime_minutes}m {uptime_secs}s"
+            },
+            "dependencies": {
+                "yt-dlp": {
+                    "status": yt_dlp_status,
+                    "version": yt_dlp_version
+                },
+                "python": {
+                    "version": sys.version.split()[0]
+                }
+            },
+            "endpoints": {
+                "transcribe": "/transcribe",
+                "health": "/health",
+                "status": "/status"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting status: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
