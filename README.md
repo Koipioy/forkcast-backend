@@ -1,124 +1,62 @@
-# forkcast-backend
+# Forkcast Backend
 
-Backend for Forkcast project - API for video transcription using yt-dlp.
+Firebase Cloud Functions backend for Forkcast - LLM Proxy with Stripe Metered Billing.
 
-## Features
+## Quick Start
 
-- FastAPI-based REST API
-- Video transcription using yt-dlp
-- Automatic subtitle extraction (supports manual and auto-generated subtitles)
-- CORS enabled for frontend integration
+1. **Install dependencies:**
+   ```bash
+   cd functions
+   npm install
+   ```
+
+2. **Configure Firebase:**
+   ```bash
+   firebase login
+   firebase init functions
+   ```
+
+3. **Set environment variables:**
+   ```bash
+   firebase functions:config:set openai.key="sk-..."
+   firebase functions:config:set stripe.secret="sk_live_..."
+   firebase functions:config:set stripe.price="price_..."
+   firebase functions:config:set stripe.webhook_secret="whsec_..."
+   ```
+
+4. **Deploy:**
+   ```bash
+   firebase deploy --only functions
+   ```
+
+## Documentation
+
+See [functions/README.md](./functions/README.md) for complete documentation including:
+- API endpoints
+- Firestore schema
+- Frontend integration examples
+- Troubleshooting guide
+
+## Project Structure
+
+```
+.
+├── functions/          # Firebase Cloud Functions
+│   ├── index.js       # Main entry point
+│   ├── auth.js        # Token verification
+│   ├── users.js       # User management
+│   ├── llm.js         # LLM proxy
+│   ├── billing.js     # Stripe operations
+│   ├── usage.js       # Usage logging
+│   └── package.json   # Dependencies
+└── README.md          # This file
+```
 
 ## API Endpoints
 
-### `POST /transcribe`
-Get transcription of a video from a URL.
+- `POST /runLLM` - Main LLM endpoint
+- `POST /createStripeCustomer` - Create Stripe customer & subscription
+- `POST /stripeWebhook` - Stripe webhook handler
 
-**Request:**
-```json
-{
-  "url": "https://www.youtube.com/watch?v=VIDEO_ID"
-}
-```
+All endpoints require Firebase Auth token in `Authorization: Bearer <token>` header.
 
-**Response:**
-```json
-{
-  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
-  "title": "Video Title",
-  "transcription": "Full transcription text...",
-  "success": true
-}
-```
-
-### `GET /health`
-Health check endpoint.
-
-**Response:**
-```json
-{
-  "status": "healthy"
-}
-```
-
-### `GET /status`
-Get detailed status information about the API service.
-
-**Response:**
-```json
-{
-  "status": "operational",
-  "service": "Forkcast Backend API",
-  "version": "1.0.0",
-  "timestamp": "2024-01-01T00:00:00Z",
-  "uptime": {
-    "seconds": 3600,
-    "formatted": "1h 0m 0s"
-  },
-  "dependencies": {
-    "yt-dlp": {
-      "status": "available",
-      "version": "2023.11.16"
-    },
-    "python": {
-      "version": "3.11.0"
-    }
-  },
-  "endpoints": {
-    "transcribe": "/transcribe",
-    "health": "/health",
-    "status": "/status"
-  }
-}
-```
-
-### `GET /`
-API information and available endpoints.
-
-## Local Development
-
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-2. Run the server:
-```bash
-uvicorn main:app --reload
-```
-
-3. Access the API:
-- API: http://localhost:8000
-- Interactive docs: http://localhost:8000/docs
-- Alternative docs: http://localhost:8000/redoc
-
-## Deployment on Railway
-
-1. Push your code to a Git repository (GitHub, GitLab, etc.)
-
-2. Go to [Railway](https://railway.com/new) and create a new project
-
-3. Connect your repository
-
-4. Railway will automatically detect the Python project and deploy it
-
-5. The API will be available at your Railway-provided URL
-
-### Railway Configuration
-
-The project includes:
-- `Procfile`: Defines the web process
-- `railway.json`: Railway-specific configuration
-- `requirements.txt`: Python dependencies
-
-Railway will automatically:
-- Install Python dependencies
-- Run the FastAPI server on the provided PORT
-
-## Usage Example
-
-```bash
-curl -X POST "https://your-railway-url.railway.app/transcribe" \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=VIDEO_ID"}'
-```
