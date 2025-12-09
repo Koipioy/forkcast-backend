@@ -58,18 +58,39 @@ async function updateUser(uid, updates) {
 
 /**
  * Sets Stripe customer information for a user
+ * Creates the user document if it doesn't exist, or updates it if it does
  * @param {string} uid - User ID
  * @param {string} stripeCustomerId - Stripe customer ID
- * @param {string} subscriptionId - Stripe subscription ID
- * @param {string} subscriptionItemId - Stripe subscription item ID
+ * @param {string|null} subscriptionId - Stripe subscription ID (optional)
+ * @param {string|null} subscriptionItemId - Stripe subscription item ID (optional)
  * @returns {Promise<object>} - Updated user document
  */
 async function setStripeInfo(uid, stripeCustomerId, subscriptionId, subscriptionItemId) {
-  return await updateUser(uid, {
+  const updates = {
     stripeCustomerId,
-    subscriptionId,
-    subscriptionItemId
-  });
+    updatedAt: Date.now()
+  };
+  
+  if (subscriptionId) {
+    updates.subscriptionId = subscriptionId;
+  }
+  
+  if (subscriptionItemId) {
+    updates.subscriptionItemId = subscriptionItemId;
+  }
+  
+  // Use set with merge to create document if it doesn't exist, or update if it does
+  const userRef = db.collection(USERS_COLLECTION).doc(uid);
+  const userDoc = await userRef.get();
+  
+  if (!userDoc.exists) {
+    // Document doesn't exist, set createdAt as well
+    updates.createdAt = Date.now();
+  }
+  
+  await userRef.set(updates, { merge: true });
+  
+  return getUser(uid);
 }
 
 /**

@@ -71,10 +71,13 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
       return;
     }
 
-    // 5. Call LLM API
+    // 5. Call LLM API (with automatic fallback to other providers if one fails)
     const llmResponse = await callLLM(prompt);
 
-    const { output, tokensUsed, model } = llmResponse;
+    const { output, tokensUsed, model, provider } = llmResponse;
+    
+    // Log which provider was used
+    console.log(`LLM request completed using provider: ${provider}`);
 
     // 6. Save usage to Firestore
     await logUsage(uid, tokensUsed, model);
@@ -99,7 +102,8 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
       output,
       tokensUsed,
       unitsReported,
-      model
+      model,
+      provider // Include which provider was used
     });
 
   } catch (error) {
@@ -164,36 +168,176 @@ exports.createStripeCustomer = functions.https.onRequest(async (req, res) => {
     // 4. Create Stripe customer
     const customer = await createCustomer(email, uid);
 
-    // 5. Create metered subscription
-    const { subscription, subscriptionItem } = await createMeteredSubscription(customer.id);
+    // 5. Store customer ID in Firestore
+    await setStripeInfo(uid, customer.id, null, null);
 
-    // 6. Store Stripe info in Firestore
-    await setStripeInfo(
-      uid,
-      customer.id,
-      subscription.id,
-      subscriptionItem.id
-    );
+    // 6. Try to create metered subscription if STRIPE_PRICE is configured
+    // This is optional - for checkout session flow, subscription will be created via checkout
+    let subscription = null;
+    let subscriptionItem = null;
+    
+    const STRIPE_PRICE = process.env.STRIPE_PRICE || functions.config().stripe?.price;
+    if (STRIPE_PRICE) {
+      try {
+        const result = await createMeteredSubscription(customer.id);
+        subscription = result.subscription;
+        subscriptionItem = result.subscriptionItem;
+        
+        // Update Firestore with subscription info
+        await setStripeInfo(
+          uid,
+          customer.id,
+          subscription.id,
+          subscriptionItem.id
+        );
+      } catch (error) {
+        // If subscription creation fails, that's okay - customer is still created
+        console.warn('Could not create metered subscription (this is okay for checkout flow):', error.message);
+      }
+    }
 
-    // 7. Return customer and subscription info
-    res.status(200).json({
+    // 7. Return customer and subscription info (if created)
+    const response = {
       customer: {
         id: customer.id,
         email: customer.email
-      },
-      subscription: {
+      }
+    };
+    
+    if (subscription && subscriptionItem) {
+      response.subscription = {
         id: subscription.id,
         status: subscription.status
-      },
-      subscriptionItem: {
+      };
+      response.subscriptionItem = {
         id: subscriptionItem.id,
         price: subscriptionItem.price.id
-      }
-    });
+      };
+    }
+    
+    res.status(200).json(response);
 
   } catch (error) {
     console.error('Error in createStripeCustomer:', error);
     res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * POST /createCheckoutSession
+ * Creates a Stripe Checkout Session for subscription
+ * 
+ * Request:
+ *   Headers: Authorization: Bearer <firebase_id_token>
+ *   Body: {
+ *     "priceId": "price_...", // Required
+ *     "successUrl": "forkcast://subscription-success", // Optional
+ *     "cancelUrl": "forkcast://subscription-cancel" // Optional
+ *   }
+ * 
+ * Response:
+ *   { "success": true, "url": "https://checkout.stripe.com/...", "sessionId": "cs_..." }
+ */
+exports.createCheckoutSession = functions.https.onRequest(async (req, res) => {
+  // Enable CORS
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  // Only allow POST
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    return;
+  }
+
+  try {
+    // 1. Verify Firebase ID token
+    const { uid, decoded } = await getAuthenticatedUser(req);
+
+    // 2. Get request body
+    const { priceId, successUrl, cancelUrl } = req.body || {};
+
+    if (!priceId) {
+      res.status(400).json({ error: 'Bad request', message: 'priceId is required' });
+      return;
+    }
+
+    // 3. Check if Stripe is configured
+    if (!stripe) {
+      res.status(500).json({ 
+        error: 'Configuration error',
+        message: 'Stripe secret key not configured. Please set it with: firebase functions:config:set stripe.secret="sk_test_..."'
+      });
+      return;
+    }
+
+    // 4. Get or create Stripe customer
+    const user = await getUser(uid);
+    
+    let customerId;
+    if (user?.stripeCustomerId) {
+      customerId = user.stripeCustomerId;
+    } else {
+      // Create customer if doesn't exist
+      const email = decoded.email;
+      if (!email) {
+        res.status(400).json({ error: 'User email not found in token' });
+        return;
+      }
+      
+      const customer = await createCustomer(email, uid);
+      customerId = customer.id;
+      
+      // Save customer ID to Firestore
+      await setStripeInfo(uid, customerId, null, null);
+    }
+
+    // 5. Create Checkout Session
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: successUrl || 'forkcast://subscription-success',
+      cancel_url: cancelUrl || 'forkcast://subscription-cancel',
+      metadata: {
+        firebaseUID: uid,
+      },
+    });
+
+    // 6. Return checkout session URL
+    res.status(200).json({
+      success: true,
+      url: session.url,
+      sessionId: session.id,
+    });
+
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    
+    // Handle specific Stripe errors
+    if (error.type === 'StripeInvalidRequestError') {
+      return res.status(400).json({ 
+        error: 'Invalid request',
+        message: error.message 
+      });
+    }
+    
+    return res.status(500).json({ 
       error: 'Internal server error',
       message: error.message 
     });
