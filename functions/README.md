@@ -140,8 +140,11 @@ curl -X POST \
   https://us-central1-<project-id>.cloudfunctions.net/runLLM \
   -H "Authorization: Bearer <firebase_id_token>" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain quantum physics simply"}'
+  -d '{"prompt": "Explain quantum physics simply", "provider": "openai", "model": "gpt-5.6-luna"}'
 ```
+
+`provider` is optional. If omitted, the backend infers it from the model name and
+falls back to OpenAI. Supported providers are `openai`, `anthropic`, and `google`.
 
 **Response:**
 ```json
@@ -149,7 +152,8 @@ curl -X POST \
   "output": "Quantum physics is...",
   "tokensUsed": 1234,
   "unitsReported": 1,
-  "model": "gpt-4o-mini"
+  "model": "gpt-5.6-luna",
+  "provider": "openai"
 }
 ```
 
@@ -257,7 +261,10 @@ For local testing, you can set environment variables in `.env` (not committed):
 
 ```bash
 # .env (local development only)
-OPENAI_KEY=sk-...
+OPENAI_API_KEY=sk-...
+# OPENAI_KEY is also accepted for backwards compatibility.
+ANTHROPIC_API_KEY=sk-ant-...
+GEMINI_API_KEY=...
 STRIPE_SECRET=sk_test_...
 STRIPE_PRICE=price_...
 ```

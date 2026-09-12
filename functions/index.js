@@ -45,8 +45,8 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
     // 1. Verify Firebase ID token
     const { uid } = await getAuthenticatedUser(req);
 
-    // 2. Extract prompt from request body
-    const { prompt } = req.body;
+    // 2. Extract prompt and optional provider/model from request body
+    const { prompt, provider, model } = req.body;
 
     if (!prompt || typeof prompt !== 'string') {
       res.status(400).json({ error: 'Missing or invalid prompt in request body' });
@@ -71,16 +71,21 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
       return;
     }
 
-    // 5. Call LLM API (with automatic fallback to other providers if one fails)
-    const llmResponse = await callLLM(prompt);
+    // 5. Call LLM API using the selected provider/model.
+    const llmResponse = await callLLM(prompt, { provider, model });
 
-    const { output, tokensUsed, model, provider } = llmResponse;
-    
+    const {
+      output,
+      tokensUsed,
+      model: usedModel,
+      provider: usedProvider,
+    } = llmResponse;
+
     // Log which provider was used
-    console.log(`LLM request completed using provider: ${provider}`);
+    console.log(`LLM request completed using provider: ${usedProvider}`);
 
     // 6. Save usage to Firestore
-    await logUsage(uid, tokensUsed, model);
+    await logUsage(uid, tokensUsed, usedModel);
 
     // 7. Convert tokens to units and report to Stripe
     const units = Math.ceil(tokensUsed / 100000);
@@ -102,8 +107,8 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
       output,
       tokensUsed,
       unitsReported,
-      model,
-      provider // Include which provider was used
+      model: usedModel,
+      provider: usedProvider, // Include which provider was used
     });
 
   } catch (error) {
