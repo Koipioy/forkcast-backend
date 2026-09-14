@@ -8,52 +8,64 @@
  */
 
 const OpenAI = require('openai');
-const functions = require('firebase-functions');
 const { DEFAULT_MODEL_ID } = require('./billing/config');
+const {
+  openaiApiKey,
+  anthropicApiKey,
+  geminiApiKey,
+  safeSecret,
+} = require('./billing/params');
 
 const PROVIDERS = ['openai', 'anthropic', 'google'];
 
-function envOrConfig(envKeys, configPath) {
+function envFirst(envKeys) {
   for (const key of envKeys) {
     const value = process.env[key];
     if (value) return value;
   }
-
-  try {
-    const configValue = configPath
-      .split('.')
-      .reduce((acc, part) => (acc == null ? undefined : acc[part]), functions.config());
-    if (configValue) return configValue;
-  } catch (_error) {
-    // functions.config() may be unavailable in local tests.
-  }
-
   return undefined;
 }
 
-const OPENAI_KEY = envOrConfig(['OPENAI_API_KEY', 'OPENAI_KEY'], 'openai.key');
-const OPENAI_BASE_URL = envOrConfig(['OPENAI_BASE_URL', 'OPENAI_API_URL'], 'openai.base_url');
-const ANTHROPIC_KEY = envOrConfig(['ANTHROPIC_API_KEY'], 'anthropic.key');
-const ANTHROPIC_BASE_URL = envOrConfig(['ANTHROPIC_BASE_URL'], 'anthropic.base_url');
-const GEMINI_KEY = envOrConfig(['GEMINI_API_KEY'], 'gemini.key');
-const GEMINI_BASE_URL = envOrConfig(['GEMINI_BASE_URL'], 'gemini.base_url');
+function getOpenAIKey() {
+  return envFirst(['OPENAI_API_KEY', 'OPENAI_KEY']) || safeSecret(openaiApiKey);
+}
 
-if (!OPENAI_KEY) {
-  console.warn('Warning: OPENAI_API_KEY/OPENAI_KEY not set. OpenAI LLM calls will fail.');
+function getOpenAIBaseUrl() {
+  return envFirst(['OPENAI_BASE_URL', 'OPENAI_API_URL']);
 }
-if (!ANTHROPIC_KEY) {
-  console.warn('Warning: ANTHROPIC_API_KEY not set. Anthropic LLM calls will fail.');
+
+function getAnthropicKey() {
+  return envFirst(['ANTHROPIC_API_KEY']) || safeSecret(anthropicApiKey);
 }
-if (!GEMINI_KEY) {
-  console.warn('Warning: GEMINI_API_KEY not set. Google Gemini LLM calls will fail.');
+
+function getAnthropicBaseUrl() {
+  return envFirst(['ANTHROPIC_BASE_URL']);
+}
+
+function getGeminiKey() {
+  return envFirst(['GEMINI_API_KEY']) || safeSecret(geminiApiKey);
+}
+
+function getGeminiBaseUrl() {
+  return envFirst(['GEMINI_BASE_URL']);
 }
 
 let openaiClient = null;
-if (OPENAI_KEY) {
+let openaiClientKey = null;
+
+function getOpenAIClient() {
+  const key = getOpenAIKey();
+  if (!key) return null;
+  if (openaiClient && openaiClientKey === key) {
+    return openaiClient;
+  }
+  const baseUrl = getOpenAIBaseUrl();
   openaiClient = new OpenAI({
-    apiKey: OPENAI_KEY,
-    ...(OPENAI_BASE_URL ? { baseURL: OPENAI_BASE_URL } : {}),
+    apiKey: key,
+    ...(baseUrl ? { baseURL: baseUrl } : {}),
   });
+  openaiClientKey = key;
+  return openaiClient;
 }
 
 function defaultModelParts() {
@@ -179,7 +191,8 @@ function buildGoogleContent(prompt, image) {
 }
 
 async function callOpenAI(prompt, model = null, options = {}) {
-  if (!openaiClient) {
+  const client = getOpenAIClient();
+  if (!client) {
     throw new Error('OpenAI client not initialized. Check OPENAI_API_KEY configuration.');
   }
 
@@ -196,10 +209,11 @@ async function callOpenAI(prompt, model = null, options = {}) {
   };
 
   if (options.maxTokens) {
-    body.max_tokens = options.maxTokens;
+    // Newer OpenAI chat models reject max_tokens. Use the current parameter name.
+    body.max_completion_tokens = options.maxTokens;
   }
 
-  const response = await openaiClient.chat.completions.create(body);
+  const response = await client.chat.completions.create(body);
 
   const output = response.choices?.[0]?.message?.content || '';
   const usage = normalizeOpenAIUsage(response.usage);
@@ -215,19 +229,20 @@ async function callOpenAI(prompt, model = null, options = {}) {
 }
 
 async function callAnthropic(prompt, model, options = {}) {
-  if (!ANTHROPIC_KEY) {
+  const anthropicKey = getAnthropicKey();
+  if (!anthropicKey) {
     throw new Error('Anthropic API key is not configured. Set ANTHROPIC_API_KEY.');
   }
   if (!model) {
     throw new Error('Anthropic model is required.');
   }
 
-  const baseUrl = trimTrailingSlash(ANTHROPIC_BASE_URL || 'https://api.anthropic.com');
+  const baseUrl = trimTrailingSlash(getAnthropicBaseUrl() || 'https://api.anthropic.com');
 
   const response = await fetch(`${baseUrl}/v1/messages`, {
     method: 'POST',
     headers: {
-      'x-api-key': ANTHROPIC_KEY,
+      'x-api-key': anthropicKey,
       'anthropic-version': '2023-06-01',
       'Content-Type': 'application/json',
     },
@@ -281,7 +296,8 @@ async function callAnthropic(prompt, model, options = {}) {
 }
 
 async function callGoogle(prompt, model, options = {}) {
-  if (!GEMINI_KEY) {
+  const geminiKey = getGeminiKey();
+  if (!geminiKey) {
     throw new Error('Gemini API key is not configured. Set GEMINI_API_KEY.');
   }
   if (!model) {
@@ -289,7 +305,7 @@ async function callGoogle(prompt, model, options = {}) {
   }
 
   const baseUrl = trimTrailingSlash(
-    GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
+    getGeminiBaseUrl() || 'https://generativelanguage.googleapis.com/v1beta',
   );
 
   const body = {
@@ -303,7 +319,7 @@ async function callGoogle(prompt, model, options = {}) {
   }
 
   const response = await fetch(
-    `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_KEY)}`,
+    `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`,
     {
       method: 'POST',
       headers: {

@@ -13,26 +13,8 @@
 const DEFAULT_PRICING_VERSION = '2026-09-v1';
 const DEFAULT_MARKUP_BPS = 1000; // 10%
 
-function safeRuntimeConfig() {
-  try {
-    // firebase-functions may not be available in pure unit tests.
-    const functions = require('firebase-functions');
-    if (functions && typeof functions.config === 'function') {
-      return functions.config() || {};
-    }
-  } catch (_err) {
-    // Ignore.
-  }
-  return {};
-}
-
 function envInt(name, fallback) {
-  const cfg = safeRuntimeConfig();
-  const envValue = process.env[name];
-  const cfgValue =
-    cfg?.billing?.[name.toLowerCase()] ??
-    cfg?.billing?.[name.toLowerCase().replace(/_/g, '_')];
-  const raw = envValue ?? cfgValue ?? fallback;
+  const raw = process.env[name] ?? fallback;
   const n = Number(raw);
   if (!Number.isInteger(n)) {
     throw new Error(`${name} must be an integer`);
@@ -41,10 +23,8 @@ function envInt(name, fallback) {
 }
 
 function envStr(name, fallback) {
-  const cfg = safeRuntimeConfig();
-  const envValue = process.env[name];
-  const cfgValue = cfg?.billing?.[name.toLowerCase()];
-  return String(envValue ?? cfgValue ?? fallback);
+  const raw = process.env[name] ?? fallback;
+  return String(raw);
 }
 
 const PRICING_VERSION = envStr('BILLING_PRICING_VERSION', DEFAULT_PRICING_VERSION);

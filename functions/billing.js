@@ -9,7 +9,6 @@
  */
 
 const Stripe = require('stripe');
-const functions = require('firebase-functions');
 const { db } = require('./firebase');
 const {
   PAYMENT_FEE_ESTIMATE,
@@ -25,37 +24,39 @@ const { estimatePaymentFeeMicros } = require('./billing/paymentFees');
 const { appendLedgerEntry } = require('./billing/ledger');
 const { ensureUserDoc, releaseReservation } = require('./billing/balance');
 const { increment } = require('./billing/firestoreValue');
+const { stripeSecret, stripeWebhookSecret, safeSecret } = require('./billing/params');
 
-const STRIPE_SECRET = process.env.STRIPE_SECRET || functions.config().stripe?.secret;
-const STRIPE_WEBHOOK_SECRET =
-  process.env.STRIPE_WEBHOOK_SECRET || functions.config().stripe?.webhook_secret;
-const SUCCESS_URL =
-  process.env.BILLING_SUCCESS_URL ||
-  functions.config().billing?.success_url ||
-  'forkcast://topup-success';
-const CANCEL_URL =
-  process.env.BILLING_CANCEL_URL ||
-  functions.config().billing?.cancel_url ||
-  'forkcast://topup-cancel';
-
-if (!STRIPE_SECRET) {
-  console.warn('Warning: STRIPE_SECRET not set. Top-up functions will fail.');
+function getStripeSecret() {
+  return process.env.STRIPE_SECRET || safeSecret(stripeSecret);
 }
-if (!STRIPE_WEBHOOK_SECRET) {
-  console.warn('Warning: STRIPE_WEBHOOK_SECRET not set. Stripe webhook verification will fail.');
+
+function getStripeWebhookSecret() {
+  return process.env.STRIPE_WEBHOOK_SECRET || safeSecret(stripeWebhookSecret);
+}
+
+function getSuccessUrl() {
+  return process.env.BILLING_SUCCESS_URL || 'forkcast://topup-success';
+}
+
+function getCancelUrl() {
+  return process.env.BILLING_CANCEL_URL || 'forkcast://topup-cancel';
 }
 
 let stripe = null;
-if (STRIPE_SECRET) {
-  // Do not pin an old Stripe API version. The account default is newer, and
-  // old pinned versions can be rejected by Stripe.
-  stripe = new Stripe(STRIPE_SECRET);
-}
+let stripeClientSecret = null;
 
 function getStripe() {
-  if (!stripe) {
+  const secret = getStripeSecret();
+  if (!secret) {
     throw new Error('Stripe client not initialized. Check STRIPE_SECRET configuration.');
   }
+  if (stripe && stripeClientSecret === secret) {
+    return stripe;
+  }
+  // Do not pin an old Stripe API version. The account default is newer, and
+  // old pinned versions can be rejected by Stripe.
+  stripe = new Stripe(secret);
+  stripeClientSecret = secret;
   return stripe;
 }
 
@@ -120,8 +121,8 @@ async function createTopupCheckout({ uid, email, optionId }) {
         },
       },
     ],
-    success_url: `${SUCCESS_URL}?topupId=${encodeURIComponent(topupId)}&status=success`,
-    cancel_url: `${CANCEL_URL}?topupId=${encodeURIComponent(topupId)}&status=cancelled`,
+    success_url: `${getSuccessUrl()}?topupId=${encodeURIComponent(topupId)}&status=success`,
+    cancel_url: `${getCancelUrl()}?topupId=${encodeURIComponent(topupId)}&status=cancelled`,
     metadata: {
       firebaseUID: String(uid),
       topupId,

@@ -1,218 +1,132 @@
-# Deployment Instructions
+# Deployment Guide
 
-## Prerequisites
+## Runtime
 
-1. **Firebase CLI installed:**
-   ```bash
-   npm install -g firebase-tools
-   ```
+```text
+Node.js 22 (1st Gen Cloud Functions)
+firebase-functions v7
+```
 
-2. **Firebase project created:**
-   - Go to https://console.firebase.google.com
-   - Create a new project or select existing one
+The code uses `firebase-functions/v1` because the deployed functions are 1st Gen.
+Do not switch exports to 2nd Gen unless you intentionally recreate the functions.
 
-3. **Stripe account set up:**
-   - Create a metered price in Stripe Dashboard
-   - Note the Price ID (starts with `price_`)
+## Local Firebase CLI
 
-## Step-by-Step Deployment
-
-### 1. Initialize Firebase (if not already done)
+Use the repo-local Firebase CLI:
 
 ```bash
-firebase login
-firebase init functions
+cd /home/lilwilly/projects/forkast/forkcast-backend
+npx firebase --version
 ```
 
-When prompted:
-- Select your Firebase project
-- Choose JavaScript (or TypeScript if preferred)
-- Install dependencies: Yes
+Current verified CLI version:
 
-### 2. Install Dependencies
+```text
+15.30.0
+```
+
+## Deploy Functions
 
 ```bash
-cd functions
-npm install
+cd /home/lilwilly/projects/forkast/forkcast-backend
+npx firebase deploy --only functions --project forkast-da914 --force
 ```
 
-### 3. Configure Environment Variables
-
-Set all required secrets:
+## Deploy Firestore Rules And Indexes
 
 ```bash
-# OpenAI API Key
-firebase functions:config:set openai.key="sk-..."
-
-# Stripe Secret Key (use sk_test_... for testing, sk_live_... for production)
-firebase functions:config:set stripe.secret="sk_test_..."
-
-# Stripe Price ID (your metered price)
-firebase functions:config:set stripe.price="price_..."
-
-# Stripe Webhook Secret (set this after creating webhook in step 6)
-firebase functions:config:set stripe.webhook_secret="whsec_..."
+cd /home/lilwilly/projects/forkast/forkcast-backend
+npx firebase deploy --only firestore --project forkast-da914 --force
 ```
 
-**Verify configuration:**
-```bash
-firebase functions:config:get
+## Secrets
+
+Secrets are stored in Firebase Secret Manager.
+
+Required names:
+
+```text
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+GEMINI_API_KEY
+STRIPE_SECRET
+STRIPE_WEBHOOK_SECRET
 ```
 
-### 4. Deploy Functions
-
-```bash
-# From project root
-firebase deploy --only functions
-
-# Or from functions directory
-cd functions
-firebase deploy --only functions
-```
-
-**Deploy specific function:**
-```bash
-firebase deploy --only functions:runLLM
-```
-
-### 5. Get Function URLs
-
-After deployment, you'll see output like:
-
-```
-✔  functions[runLLM(us-central1)]: Successful create operation.
-✔  functions[createStripeCustomer(us-central1)]: Successful create operation.
-✔  functions[stripeWebhook(us-central1)]: Successful create operation.
-
-Function URLs:
-  runLLM: https://us-central1-<project-id>.cloudfunctions.net/runLLM
-  createStripeCustomer: https://us-central1-<project-id>.cloudfunctions.net/createStripeCustomer
-  stripeWebhook: https://us-central1-<project-id>.cloudfunctions.net/stripeWebhook
-```
-
-### 6. Configure Stripe Webhook
-
-1. Go to [Stripe Dashboard > Webhooks](https://dashboard.stripe.com/webhooks)
-2. Click **"Add endpoint"**
-3. Enter endpoint URL:
-   ```
-   https://us-central1-<your-project-id>.cloudfunctions.net/stripeWebhook
-   ```
-4. Select events to listen to:
-   - `invoice.paid`
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
-5. Click **"Add endpoint"**
-6. Copy the **Signing secret** (starts with `whsec_`)
-7. Set it in Firebase:
-   ```bash
-   firebase functions:config:set stripe.webhook_secret="whsec_..."
-   ```
-8. Redeploy:
-   ```bash
-   firebase deploy --only functions:stripeWebhook
-   ```
-
-### 7. Test Deployment
-
-**Test runLLM endpoint:**
-```bash
-curl -X POST \
-  https://us-central1-<project-id>.cloudfunctions.net/runLLM \
-  -H "Authorization: Bearer <firebase_id_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, world!"}'
-```
-
-**Test createStripeCustomer:**
-```bash
-curl -X POST \
-  https://us-central1-<project-id>.cloudfunctions.net/createStripeCustomer \
-  -H "Authorization: Bearer <firebase_id_token>"
-```
-
-## Updating Functions
-
-After making code changes:
+Set a secret:
 
 ```bash
-# Deploy all functions
-firebase deploy --only functions
-
-# Deploy specific function
-firebase deploy --only functions:runLLM
-
-# Deploy with force (if needed)
-firebase deploy --only functions --force
+npx firebase functions:secrets:set STRIPE_SECRET --project forkast-da914
 ```
 
-## Viewing Logs
+After changing secrets, redeploy functions:
 
 ```bash
-# All logs
-firebase functions:log
-
-# Specific function
-firebase functions:log --only runLLM
-
-# Follow logs in real-time
-firebase functions:log --follow
+npx firebase deploy --only functions --project forkast-da914 --force
 ```
 
-Or view in Firebase Console:
-https://console.firebase.google.com/project/<project-id>/functions/logs
+## Non-Secret Environment Variables
 
-## Environment Variables Reference
+Non-secret values are loaded from:
 
-| Variable | Command | Description |
-|----------|---------|-------------|
-| `openai.key` | `firebase functions:config:set openai.key="sk-..."` | OpenAI API key |
-| `stripe.secret` | `firebase functions:config:set stripe.secret="sk_..."` | Stripe secret key |
-| `stripe.price` | `firebase functions:config:set stripe.price="price_..."` | Stripe metered price ID |
-| `stripe.webhook_secret` | `firebase functions:config:set stripe.webhook_secret="whsec_..."` | Stripe webhook signing secret |
+```text
+functions/.env
+```
 
-## Troubleshooting
+Examples:
 
-### "Permission denied" errors
-- Ensure you're logged in: `firebase login`
-- Check project permissions in Firebase Console
+```text
+OPENAI_BASE_URL=https://api.openai.com/v1
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+BILLING_MARKUP_BPS=1000
+BILLING_PRICING_VERSION=2026-09-v1
+BILLING_ENFORCEMENT=on
+BILLING_SUCCESS_URL=forkcast://topup-success
+BILLING_CANCEL_URL=forkcast://topup-cancel
+```
 
-### "Function failed to deploy"
-- Check logs: `firebase functions:log`
-- Verify all environment variables are set
-- Check Node.js version (should be 18+)
-
-### "Module not found" errors
-- Run `npm install` in functions directory
-- Check package.json dependencies
-
-### Webhook signature verification fails
-- Ensure webhook secret matches Stripe Dashboard
-- Verify webhook URL is correct
-- Check that webhook is enabled in Stripe
-
-## Production Checklist
-
-- [ ] All environment variables set
-- [ ] Stripe webhook configured
-- [ ] Functions deployed successfully
-- [ ] Test endpoints working
-- [ ] Logs accessible
-- [ ] CORS configured (if needed for web frontend)
-- [ ] Error handling tested
-- [ ] Billing flow tested end-to-end
-
-## Rollback
-
-If you need to rollback:
+## Verify Deployment
 
 ```bash
-# List deployments
-firebase functions:list
-
-# Rollback to previous version (if available in Firebase Console)
-# Or redeploy previous code from git
-git checkout <previous-commit>
-firebase deploy --only functions
+curl https://us-central1-forkast-da914.cloudfunctions.net/health
 ```
 
+Expected:
+
+```json
+{
+  "ok": true,
+  "service": "forkcast-backend",
+  "pricingVersion": "2026-09-v1",
+  "config": {
+    "hasOpenAIKey": true,
+    "hasAnthropicKey": true,
+    "hasGeminiKey": true,
+    "hasStripeSecret": true,
+    "hasStripeWebhookSecret": true
+  }
+}
+```
+
+## Stripe Webhook
+
+Endpoint:
+
+```text
+https://us-central1-forkast-da914.cloudfunctions.net/stripeWebhook
+```
+
+Events:
+
+```text
+checkout.session.completed
+checkout.session.async_payment_succeeded
+checkout.session.async_payment_failed
+charge.refunded
+```
+
+## Notes
+
+- `functions.config()` is removed in `firebase-functions` v7.
+- Do not use `firebase functions:config:set` for new configuration.
+- The old committed Stripe test secret must be rolled in the Stripe dashboard.

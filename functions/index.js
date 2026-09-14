@@ -15,7 +15,7 @@
  */
 
 const crypto = require('crypto');
-const functions = require('firebase-functions');
+const functions = require('firebase-functions/v1');
 
 const { db } = require('./firebase');
 const { getAuthenticatedUser } = require('./auth');
@@ -53,6 +53,18 @@ const {
   processStripeEvent,
   releaseExpiredReservations,
 } = require('./billing');
+const {
+  openaiApiKey,
+  anthropicApiKey,
+  geminiApiKey,
+  stripeSecret,
+  stripeWebhookSecret,
+  safeSecret,
+} = require('./billing/params');
+
+const AI_SECRETS = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY'];
+const STRIPE_SECRETS = ['STRIPE_SECRET', 'STRIPE_WEBHOOK_SECRET'];
+const ALL_SECRETS = [...AI_SECRETS, ...STRIPE_SECRETS];
 
 const OPERATION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
@@ -657,7 +669,7 @@ async function runAIHandler(req, res, options = {}) {
 /**
  * POST /runAI
  */
-exports.runAI = functions.https.onRequest(async (req, res) => {
+exports.runAI = functions.runWith({ secrets: AI_SECRETS }).https.onRequest(async (req, res) => {
   await runAIHandler(req, res, { feature: 'unknown' });
 });
 
@@ -665,7 +677,7 @@ exports.runAI = functions.https.onRequest(async (req, res) => {
  * POST /runLLM
  * Backward-compatible alias. New clients should use /runAI with an operationId.
  */
-exports.runLLM = functions.https.onRequest(async (req, res) => {
+exports.runLLM = functions.runWith({ secrets: AI_SECRETS }).https.onRequest(async (req, res) => {
   const generatedOperationId = `legacy_${crypto.randomUUID().replace(/-/g, '')}`;
   await runAIHandler(req, res, {
     feature: req.body?.feature || 'unknown',
@@ -679,7 +691,7 @@ exports.runLLM = functions.https.onRequest(async (req, res) => {
  *
  * Body: { optionId: "usd_10" }
  */
-exports.createCheckoutSession = functions.https.onRequest(async (req, res) => {
+exports.createCheckoutSession = functions.runWith({ secrets: STRIPE_SECRETS }).https.onRequest(async (req, res) => {
   setCors(req, res);
 
   if (req.method === 'OPTIONS') {
@@ -732,7 +744,7 @@ exports.createCheckoutSession = functions.https.onRequest(async (req, res) => {
 /**
  * POST /stripeWebhook
  */
-exports.stripeWebhook = functions.https.onRequest(async (req, res) => {
+exports.stripeWebhook = functions.runWith({ secrets: STRIPE_SECRETS }).https.onRequest(async (req, res) => {
   setCors(req, res);
 
   if (req.method === 'OPTIONS') {
@@ -755,7 +767,7 @@ exports.stripeWebhook = functions.https.onRequest(async (req, res) => {
     const stripe = require('./billing').getStripe();
     const webhookSecret =
       process.env.STRIPE_WEBHOOK_SECRET ||
-      functions.config().stripe?.webhook_secret;
+      safeSecret(stripeWebhookSecret);
 
     if (!webhookSecret) {
       console.error('STRIPE_WEBHOOK_SECRET is not configured');
@@ -854,20 +866,19 @@ exports.releaseExpiredReservations = functions.pubsub
 /**
  * GET /health
  */
-exports.health = functions.https.onRequest(async (req, res) => {
+exports.health = functions.runWith({ secrets: ALL_SECRETS }).https.onRequest(async (req, res) => {
   setCors(req, res);
-  const cfg = functions.config();
   sendJson(res, 200, {
     ok: true,
     service: 'forkcast-backend',
     pricingVersion: require('./billing/config').PRICING_VERSION,
     config: {
-      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY || cfg.openai?.key),
-      hasAnthropicKey: Boolean(process.env.ANTHROPIC_API_KEY || cfg.anthropic?.key),
-      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY || cfg.gemini?.key),
-      hasStripeSecret: Boolean(process.env.STRIPE_SECRET || cfg.stripe?.secret),
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY || safeSecret(openaiApiKey)),
+      hasAnthropicKey: Boolean(process.env.ANTHROPIC_API_KEY || safeSecret(anthropicApiKey)),
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY || safeSecret(geminiApiKey)),
+      hasStripeSecret: Boolean(process.env.STRIPE_SECRET || safeSecret(stripeSecret)),
       hasStripeWebhookSecret: Boolean(
-        process.env.STRIPE_WEBHOOK_SECRET || cfg.stripe?.webhook_secret,
+        process.env.STRIPE_WEBHOOK_SECRET || safeSecret(stripeWebhookSecret),
       ),
     },
   });

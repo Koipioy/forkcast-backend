@@ -13,16 +13,13 @@
     "test:watch": "node --test --watch tests/*.test.js"
   },
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "dependencies": {
-    "firebase-admin": "^12.0.0",
-    "firebase-functions": "^4.5.0",
-    "stripe": "^14.0.0",
-    "openai": "^4.20.0"
-  },
-  "devDependencies": {
-    "firebase-functions-test": "^3.1.0"
+    "firebase-admin": "^14.4.0",
+    "firebase-functions": "^7.3.2",
+    "openai": "^4.20.0",
+    "stripe": "^14.0.0"
   },
   "private": true
 }

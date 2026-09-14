@@ -1,109 +1,131 @@
-# Stripe Setup Guide
+# Stripe Prepaid Top-Up Setup
 
-## Issue: Missing Stripe Price ID
+Forkast now uses **prepaid credit**, not a metered subscription.
 
-You're getting this error because the Stripe Price ID is not configured. Here's how to fix it:
+Users buy credit through Stripe Checkout. The Firebase backend stores the credit
+in the user's Firestore balance. AI requests debit that balance server-side.
 
----
+## Current Runtime
 
-## Step 1: Create a Metered Price in Stripe
-
-1. Go to [Stripe Dashboard > Products](https://dashboard.stripe.com/products)
-2. Click **"+ Add product"**
-3. Fill in:
-   - **Name**: "Forkcast Usage" (or any name)
-   - **Pricing model**: Select **"Metered billing"**
-   - **Price**: Enter `0.00` (or your base price)
-   - **Billing period**: Monthly (or your preference)
-   - **Usage type**: Select **"Metered"**
-   - **Unit**: Can be "unit" or "token" (doesn't matter, we report usage)
-4. Click **"Save product"**
-5. **Copy the Price ID** - it will look like `price_1ABC123xyz...`
-
----
-
-## Step 2: Set the Price ID in Firebase
-
-```bash
-firebase functions:config:set stripe.price="price_1ABC123xyz..."
+```text
+Node.js 22 (1st Gen Cloud Functions)
+firebase-functions v7
 ```
 
-Replace `price_1ABC123xyz...` with your actual Price ID from Stripe.
+Secrets are stored in Firebase Secret Manager and declared in:
 
----
-
-## Step 3: Redeploy Functions
-
-```bash
-firebase deploy --only functions
+```text
+functions/billing/params.js
 ```
 
----
+Non-secret runtime values are loaded from:
 
-## Complete Configuration
-
-Make sure you have all these set:
-
-```bash
-# Stripe Secret Key (get this from Stripe Dashboard)
-firebase functions:config:set stripe.secret="sk_test_YOUR_SECRET_KEY_HERE"
-
-# Stripe Price ID (YOU NEED TO ADD THIS)
-firebase functions:config:set stripe.price="price_YOUR_PRICE_ID_HERE"
-
-# Gemini API Key (you already have this)
-firebase functions:config:set llm.gemini_key="AIzaSyCARtV1Fcxr9dBZH-KcAY-UBePaAi33RqQ"
+```text
+functions/.env
 ```
 
----
+Do not put provider keys or Stripe keys in the Expo app bundle.
 
-## Verify Configuration
+## Required Secrets
+
+Set these with the local Firebase CLI:
 
 ```bash
-firebase functions:config:get
+cd /home/lilwilly/projects/forkast/forkcast-backend
+
+npx firebase functions:secrets:set OPENAI_API_KEY --project forkast-da914
+npx firebase functions:secrets:set ANTHROPIC_API_KEY --project forkast-da914
+npx firebase functions:secrets:set GEMINI_API_KEY --project forkast-da914
+npx firebase functions:secrets:set STRIPE_SECRET --project forkast-da914
+npx firebase functions:secrets:set STRIPE_WEBHOOK_SECRET --project forkast-da914
 ```
 
-You should see:
+Then deploy:
+
+```bash
+npx firebase deploy --only functions --project forkast-da914 --force
+```
+
+## Stripe Webhook
+
+Stripe Dashboard webhook endpoint:
+
+```text
+https://us-central1-forkast-da914.cloudfunctions.net/stripeWebhook
+```
+
+Required events:
+
+```text
+checkout.session.completed
+checkout.session.async_payment_succeeded
+checkout.session.async_payment_failed
+charge.refunded
+```
+
+## Top-Up Options
+
+Top-up options are configured server-side in:
+
+```text
+functions/billing/config.js
+```
+
+Default options:
+
+```text
+usd_5   = $5.00
+usd_10  = $10.00
+usd_20  = $20.00
+```
+
+The client sends only an `optionId`.
+
+## Billing Model
+
+Internal accounting uses microdollars:
+
+```text
+$1.00 = 1,000,000 microdollars
+```
+
+Default markup:
+
+```text
+10% = 1000 basis points
+```
+
+Every ledger entry stores the pricing version and actual markup used.
+
+## Rotating The Old Committed Stripe Test Secret
+
+Stripe does not expose API-key rotation through the public API. Rotate manually:
+
+1. Open Stripe Dashboard -> Developers -> API keys.
+2. Roll the old test secret key.
+3. Update Firebase Secret Manager:
+
+```bash
+cd /home/lilwilly/projects/forkast/forkcast-backend
+npx firebase functions:secrets:set STRIPE_SECRET --project forkast-da914
+npx firebase functions:secrets:set STRIPE_WEBHOOK_SECRET --project forkast-da914
+npx firebase deploy --only functions --project forkast-da914 --force
+```
+
+4. Verify:
+
+```bash
+curl https://us-central1-forkast-da914.cloudfunctions.net/health
+```
+
+Expected:
+
 ```json
 {
-  "stripe": {
-    "secret": "sk_test_...",
-    "price": "price_..."
-  },
-  "llm": {
-    "gemini_key": "AIzaSy..."
+  "ok": true,
+  "config": {
+    "hasStripeSecret": true,
+    "hasStripeWebhookSecret": true
   }
 }
 ```
-
----
-
-## About Checkout Sessions
-
-**Important:** This backend does NOT use Stripe Checkout Sessions. 
-
-The implementation works like this:
-1. User calls `/createStripeCustomer` 
-2. Backend automatically creates:
-   - Stripe Customer
-   - Metered Subscription (automatically active)
-3. User can immediately use `/runLLM`
-4. Usage is automatically reported to Stripe
-
-**You don't need a checkout session function** - subscriptions are created automatically when the customer is created.
-
-If you want checkout sessions (for payment collection), you'd need to add a separate function, but for metered billing with automatic subscription creation, you don't need it.
-
----
-
-## Quick Fix Command
-
-After creating the price in Stripe, run:
-
-```bash
-firebase functions:config:set stripe.price="YOUR_PRICE_ID"
-firebase deploy --only functions:createStripeCustomer
-```
-
-Then test again!
-

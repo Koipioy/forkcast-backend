@@ -1,359 +1,190 @@
-# Forkcast Backend - Firebase Cloud Functions
+# Forkcast Backend Functions
 
-Complete backend implementation for Forkcast: LLM Proxy with Stripe Metered Billing.
+Firebase Cloud Functions for Forkast prepaid AI billing.
 
-## Overview
+Current runtime:
 
-This backend provides:
-- 🔐 Firebase Auth token verification
-- 💳 Stripe metered (usage-based) billing
-- 📊 Firestore for user/subscription mappings and usage logs
-- 🤖 LLM API proxy (OpenAI by default, easily swappable)
-- 🔒 Secure key management via Firebase Functions config
-- 📝 Comprehensive error handling
+```text
+Node.js 22 (1st Gen Cloud Functions)
+firebase-functions v7
+```
+
+The functions intentionally use the v1 API (`firebase-functions/v1`) because the
+existing deployed functions are 1st Gen. `firebase-functions` v7 removed
+`functions.config()`, so secrets now use Firebase Secret Manager.
 
 ## Project Structure
 
-```
+```text
 functions/
-├── index.js          # Main Cloud Functions entry point
-├── firebase.js       # Firebase Admin initialization
-├── auth.js           # Token verification utilities
-├── users.js          # Firestore user operations
-├── llm.js            # LLM proxy (OpenAI)
-├── billing.js        # Stripe operations
-├── usage.js          # Usage logging to Firestore
-├── package.json      # Dependencies
-└── README.md         # This file
+├── index.js                 # HTTP and scheduled function exports
+├── llm.js                   # Provider adapters and usage normalization
+├── billing.js               # Stripe top-up checkout and webhook processing
+├── firebase.js              # Firebase Admin initialization
+├── auth.js                  # Firebase Auth helpers
+├── params.js                # Secret Manager parameter definitions
+├── billing/
+│   ├── config.js            # Pricing, markup, top-up options, feature config
+│   ├── aiCost.js            # AI and infrastructure cost calculation
+│   ├── balance.js           # Reservation, settlement, release logic
+│   ├── ledger.js            # Append-only ledger helpers
+│   ├── money.js             # Microdollar integer helpers
+│   ├── paymentFees.js       # Stripe fee estimates
+│   └── firestoreValue.js    # Firestore increment compatibility helper
+└── tests/                   # Node test files
 ```
 
-## Firestore Schema
+## Secrets
 
-### Users Collection
-```
-users/{uid}
-  - stripeCustomerId: string
-  - subscriptionId: string
-  - subscriptionItemId: string
-  - createdAt: number (timestamp)
-  - updatedAt: number (timestamp)
-```
+Required Secret Manager names:
 
-### Usage Collection
-```
-usage/{uid}/records/{autoId}
-  - tokens: number
-  - model: string
-  - timestamp: number
+```text
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+GEMINI_API_KEY
+STRIPE_SECRET
+STRIPE_WEBHOOK_SECRET
 ```
 
-## Setup Instructions
-
-### 1. Prerequisites
-
-- Node.js 18+
-- Firebase CLI installed: `npm install -g firebase-tools`
-- Firebase project created
-- Stripe account with a metered price configured
-
-### 2. Install Dependencies
+Set a secret:
 
 ```bash
-cd functions
-npm install
+npx firebase functions:secrets:set OPENAI_API_KEY --project forkast-da914
 ```
 
-### 3. Configure Firebase
+Non-secret runtime values are loaded from `functions/.env`.
+
+## Tests
 
 ```bash
-# Login to Firebase
-firebase login
-
-# Initialize Firebase (if not already done)
-firebase init functions
-
-# Select your Firebase project
+npm test
 ```
 
-### 4. Set Environment Variables
+## Deploy
 
-Set your secrets using Firebase Functions config:
+From the backend repo root:
 
 ```bash
-# OpenAI API Key
-firebase functions:config:set openai.key="sk-..."
-
-# Stripe Secret Key
-firebase functions:config:set stripe.secret="sk_live_..." # or sk_test_... for testing
-
-# Stripe Price ID (for metered billing)
-firebase functions:config:set stripe.price="price_..."
-
-# Stripe Webhook Secret (get this from Stripe Dashboard after creating webhook)
-firebase functions:config:set stripe.webhook_secret="whsec_..."
+npx firebase deploy --only functions --project forkast-da914 --force
 ```
-
-**Important:** Never commit secrets to git. They are stored securely in Firebase.
-
-### 5. Deploy Functions
-
-```bash
-# From the functions directory
-cd functions
-npm install
-firebase deploy --only functions
-```
-
-Or from the project root:
-
-```bash
-firebase deploy --only functions
-```
-
-### 6. Configure Stripe Webhook
-
-1. Go to [Stripe Dashboard > Webhooks](https://dashboard.stripe.com/webhooks)
-2. Click "Add endpoint"
-3. Enter your webhook URL: `https://us-central1-<your-project-id>.cloudfunctions.net/stripeWebhook`
-4. Select events to listen to:
-   - `invoice.paid`
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
-5. Copy the webhook signing secret and set it:
-   ```bash
-   firebase functions:config:set stripe.webhook_secret="whsec_..."
-   ```
-6. Redeploy functions:
-   ```bash
-   firebase deploy --only functions
-   ```
 
 ## API Endpoints
 
-### POST /runLLM
+Base URL:
 
-Main endpoint for LLM requests.
-
-**Request:**
-```bash
-curl -X POST \
-  https://us-central1-<project-id>.cloudfunctions.net/runLLM \
-  -H "Authorization: Bearer <firebase_id_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain quantum physics simply", "provider": "openai", "model": "gpt-5.6-luna"}'
+```text
+https://us-central1-forkast-da914.cloudfunctions.net
 ```
 
-`provider` is optional. If omitted, the backend infers it from the model name and
-falls back to OpenAI. Supported providers are `openai`, `anthropic`, and `google`.
+### POST /runAI
 
-**Response:**
+Server-authoritative AI call.
+
+Request:
+
 ```json
 {
-  "output": "Quantum physics is...",
-  "tokensUsed": 1234,
-  "unitsReported": 1,
+  "operationId": "ai_1234567890",
+  "feature": "meal_ideas",
+  "text": "hello",
+  "provider": "openai",
   "model": "gpt-5.6-luna",
-  "provider": "openai"
+  "modelId": "openai:gpt-5-6-luna",
+  "maxTokens": 1000
 }
 ```
 
-**Error Responses:**
-- `400` - Missing/invalid prompt
-- `401` - Invalid or missing auth token
-- `404` - User not found
-- `500` - Internal server error
+Response:
 
-### POST /createStripeCustomer
-
-Creates a Stripe customer and metered subscription for the authenticated user.
-
-**Request:**
-```bash
-curl -X POST \
-  https://us-central1-<project-id>.cloudfunctions.net/createStripeCustomer \
-  -H "Authorization: Bearer <firebase_id_token>"
-```
-
-**Response:**
 ```json
 {
-  "customer": {
-    "id": "cus_...",
-    "email": "user@example.com"
+  "success": true,
+  "output": "OK",
+  "provider": "openai",
+  "model": "gpt-5.6-luna",
+  "requestId": "chatcmpl-...",
+  "usage": {
+    "inputTokens": 10,
+    "outputTokens": 4,
+    "cachedInputTokens": 0,
+    "reasoningTokens": 0,
+    "totalTokens": 14
   },
-  "subscription": {
-    "id": "sub_...",
-    "status": "active"
-  },
-  "subscriptionItem": {
-    "id": "si_...",
-    "price": "price_..."
+  "billing": {
+    "rawCostMicros": 67,
+    "aiRawCostMicros": 7,
+    "infraRawCostMicros": 60,
+    "markupBps": 1000,
+    "markupMicros": 7,
+    "chargedMicros": 74,
+    "balanceBeforeMicros": 5000000,
+    "balanceAfterMicros": 4999926,
+    "pricingVersion": "2026-09-v1",
+    "ledgerId": "..."
   }
+}
+```
+
+### POST /runLLM
+
+Backward-compatible alias for `/runAI`.
+
+### POST /createCheckoutSession
+
+Creates a Stripe one-time top-up checkout.
+
+Request:
+
+```json
+{
+  "optionId": "usd_5"
+}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "topupId": "topup_...",
+  "url": "https://checkout.stripe.com/...",
+  "sessionId": "cs_test_..."
 }
 ```
 
 ### POST /stripeWebhook
 
-Stripe webhook endpoint (called by Stripe, not your app).
+Handles Stripe events:
 
-**Note:** This endpoint validates webhook signatures and handles Stripe events.
+```text
+checkout.session.completed
+checkout.session.async_payment_succeeded
+checkout.session.async_payment_failed
+charge.refunded
+```
+
+### GET /getBillingSummary
+
+Returns available balance, reserved balance, lifetime totals, top-up options,
+recent ledger entries, and recent top-ups.
+
+### GET /health
+
+Returns service status and whether required secrets are present.
 
 ## Billing Model
 
-### Token to Units Conversion
+Internal accounting uses microdollars:
 
-- **1 unit = 100,000 tokens**
-- Units are rounded up (e.g., 50,001 tokens = 1 unit, 150,000 tokens = 2 units)
-- Usage is reported to Stripe after each LLM request
-
-### Example
-
-If a user makes 3 requests:
-1. Request 1: 45,000 tokens → 1 unit
-2. Request 2: 80,000 tokens → 1 unit  
-3. Request 3: 25,000 tokens → 1 unit
-
-Total: 3 units billed to Stripe
-
-## Frontend Integration (React Native)
-
-### Example Usage
-
-```javascript
-import auth from '@react-native-firebase/auth';
-
-async function callLLM(prompt) {
-  // Get Firebase ID token
-  const user = auth().currentUser;
-  const idToken = await user.getIdToken();
-
-  // Call backend
-  const response = await fetch(
-    'https://us-central1-<project-id>.cloudfunctions.net/runLLM',
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ prompt }),
-    }
-  );
-
-  const data = await response.json();
-  return data.output;
-}
+```text
+$1.00 = 1,000,000 microdollars
 ```
 
-## Local Development
+Default markup:
 
-### Run Emulator
-
-```bash
-firebase emulators:start --only functions
+```text
+10% = 1000 basis points
 ```
 
-Functions will be available at `http://localhost:5001/<project-id>/us-central1/<function-name>`
-
-### Test Locally
-
-For local testing, you can set environment variables in `.env` (not committed):
-
-```bash
-# .env (local development only)
-OPENAI_API_KEY=sk-...
-# OPENAI_KEY is also accepted for backwards compatibility.
-ANTHROPIC_API_KEY=sk-ant-...
-GEMINI_API_KEY=...
-STRIPE_SECRET=sk_test_...
-STRIPE_PRICE=price_...
-```
-
-## Swapping LLM Providers
-
-To use a different LLM provider, modify `functions/llm.js`:
-
-1. Update `callLLM()` function to call your provider
-2. Ensure it returns: `{ output: string, tokensUsed: number, model: string }`
-3. Update `getDefaultModel()` if needed
-
-Example for Anthropic Claude:
-
-```javascript
-const Anthropic = require('@anthropic-ai/sdk');
-
-async function callClaude(prompt, model = 'claude-3-5-sonnet-20241022') {
-  const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
-  const message = await anthropic.messages.create({
-    model,
-    max_tokens: 1024,
-    messages: [{ role: 'user', content: prompt }],
-  });
-  
-  return {
-    output: message.content[0].text,
-    tokensUsed: message.usage.input_tokens + message.usage.output_tokens,
-    model
-  };
-}
-```
-
-## Monitoring & Logs
-
-View function logs:
-
-```bash
-firebase functions:log
-```
-
-Or in Firebase Console:
-https://console.firebase.google.com/project/<project-id>/functions/logs
-
-## Security Notes
-
-1. ✅ **Never commit secrets** - Use `firebase functions:config:set`
-2. ✅ **Always verify tokens** - All endpoints verify Firebase ID tokens
-3. ✅ **Validate webhook signatures** - Stripe webhooks verify signatures
-4. ✅ **CORS enabled** - Adjust CORS settings in `index.js` for production
-5. ✅ **Error handling** - Errors don't expose sensitive information
-
-## Troubleshooting
-
-### "OPENAI_KEY not set"
-- Run: `firebase functions:config:set openai.key="sk-..."`
-
-### "Stripe client not initialized"
-- Run: `firebase functions:config:set stripe.secret="sk_..."`
-
-### "User not found"
-- Call `/createStripeCustomer` first to set up billing
-
-### Webhook signature verification fails
-- Ensure webhook secret is set correctly
-- Verify webhook URL in Stripe Dashboard matches your function URL
-- Check that you're using the correct webhook secret for the endpoint
-
-## Example Firestore Queries
-
-### Get user's usage records
-```javascript
-const { db } = require('./firebase');
-const snapshot = await db
-  .collection('usage')
-  .doc(uid)
-  .collection('records')
-  .orderBy('timestamp', 'desc')
-  .limit(10)
-  .get();
-```
-
-### Get user's Stripe info
-```javascript
-const userDoc = await db.collection('users').doc(uid).get();
-const { stripeCustomerId, subscriptionId } = userDoc.data();
-```
-
-## License
-
-MIT
-
+Failed AI requests are recorded as `no_charge` when the user receives no useful
+output.

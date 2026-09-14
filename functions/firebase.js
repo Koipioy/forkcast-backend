@@ -4,20 +4,22 @@
  */
 
 const admin = require('firebase-admin');
+const { getFirestore } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 // Initialize Firebase Admin
-// In production, this uses the default service account
-// Make sure your Firebase project is properly configured
-if (!admin.apps.length) {
+// In production, this uses the default service account.
+// Make sure your Firebase project is properly configured.
+if (!admin.getApps || admin.getApps().length === 0) {
   admin.initializeApp();
 }
 
-const db = admin.firestore();
-const auth = admin.auth();
+const db = getFirestore();
+const auth = getAuth();
 
 module.exports = {
   admin,
   db,
-  auth
+  auth,
 };
 

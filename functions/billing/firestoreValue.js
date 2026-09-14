@@ -11,8 +11,8 @@ function increment(db, value) {
   if (db && db.firestore && db.firestore.FieldValue && typeof db.firestore.FieldValue.increment === 'function') {
     return db.firestore.FieldValue.increment(value);
   }
-  const admin = require('firebase-admin');
-  return admin.firestore.FieldValue.increment(value);
+  const { FieldValue } = require('firebase-admin/firestore');
+  return FieldValue.increment(value);
 }
 
 module.exports = {
