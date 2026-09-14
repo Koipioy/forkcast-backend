@@ -297,6 +297,131 @@ async function markTopupFailed(session, eventId, reason) {
   return { updated: true };
 }
 
+async function handleChargeRefunded(charge, eventId) {
+  const paymentIntent = charge?.payment_intent;
+  if (!paymentIntent) {
+    return { handled: false, reason: 'missing_payment_intent' };
+  }
+
+  const amountRefundedCents = Number(charge?.amount_refunded || 0);
+  const amountCapturedCents = Number(charge?.amount_captured || charge?.amount || 0);
+  const isFullRefund = amountRefundedCents >= amountCapturedCents && amountCapturedCents > 0;
+
+  if (!isFullRefund) {
+    return { handled: false, reason: 'partial_refund_not_supported' };
+  }
+
+  const topupSnap = await db
+    .collection('topups')
+    .where('stripePaymentIntent', '==', String(paymentIntent))
+    .limit(1)
+    .get();
+
+  if (topupSnap.empty) {
+    return { handled: false, reason: 'topup_not_found' };
+  }
+
+  const topupRef = topupSnap.docs[0].ref;
+  const topup = topupSnap.docs[0].data() || {};
+  if (topup.status !== 'completed') {
+    return { handled: false, reason: 'topup_not_completed' };
+  }
+
+  const userId = String(topup.userId);
+  const creditsIssued = Number(topup.creditsIssuedMicros || topup.amountMicros || 0);
+  if (creditsIssued <= 0) {
+    return { handled: false, reason: 'zero_credits' };
+  }
+
+  const eventRef = db.collection('stripeEvents').doc(String(eventId));
+
+  return db.runTransaction(async (tx) => {
+    const existingEvent = await eventRef.get();
+    if (existingEvent.exists && existingEvent.data()?.processed) {
+      return { credited: false, reason: 'event_already_processed' };
+    }
+
+    const freshTopupSnap = await topupRef.get();
+    if (!freshTopupSnap.exists) {
+      return { credited: false, reason: 'topup_not_found' };
+    }
+    const freshTopup = freshTopupSnap.data() || {};
+    if (freshTopup.status === 'refunded') {
+      return { credited: false, reason: 'already_refunded' };
+    }
+
+    const userRef = db.collection('users').doc(userId);
+    const userSnap = await userRef.get();
+    const user = userSnap.data() || {};
+    const available = Number(user.availableBalanceMicros || 0);
+    const debit = Math.min(available, creditsIssued);
+    const balanceBefore = available;
+    const balanceAfter = available - debit;
+
+    if (debit > 0) {
+      await userRef.set(
+        {
+          availableBalanceMicros: increment(db, -debit),
+          lifetimeRefundedMicros: increment(db, debit),
+          updatedAt: Date.now(),
+        },
+        { merge: true },
+      );
+    }
+
+    const ledgerResult = await appendLedgerEntry(db, tx, {
+      userId,
+      source: 'refund',
+      type: 'debit',
+      feature: 'refund',
+      amountMicros: -debit,
+      chargedMicros: 0,
+      balanceBeforeMicros: balanceBefore,
+      balanceAfterMicros: balanceAfter,
+      externalRequestId: charge?.id || null,
+      idempotencyKey: `refund:${charge?.id || eventId}`,
+      status: 'succeeded',
+      pricingVersion: PRICING_VERSION,
+      metadata: {
+        topupId: freshTopup.id || null,
+        creditsIssuedMicros: creditsIssued,
+        refundedFromBalanceMicros: debit,
+        uncollectedRefundMicros: Math.max(0, creditsIssued - debit),
+        stripeChargeId: charge?.id || null,
+        stripeEventId: eventId || null,
+      },
+    });
+
+    await topupRef.update({
+      status: 'refunded',
+      refundedAt: Date.now(),
+      refundStripeChargeId: charge?.id || null,
+      refundLedgerId: ledgerResult.id,
+      updatedAt: Date.now(),
+    });
+
+    await eventRef.set(
+      {
+        id: String(eventId),
+        type: 'charge.refunded',
+        processed: true,
+        processedAt: Date.now(),
+        topupId: freshTopup.id || null,
+        userId,
+      },
+      { merge: true },
+    );
+
+    return {
+      handled: true,
+      refunded: true,
+      topupId: freshTopup.id || null,
+      refundedFromBalanceMicros: debit,
+      balanceAfterMicros: balanceAfter,
+    };
+  });
+}
+
 async function processStripeEvent(event) {
   const eventId = event?.id;
   if (!eventId) return { handled: false, reason: 'missing_event_id' };
@@ -339,6 +464,10 @@ async function processStripeEvent(event) {
   if (event.type === 'checkout.session.async_payment_failed') {
     const session = event.data.object;
     return await markTopupFailed(session, eventId, 'async_payment_failed');
+  }
+
+  if (event.type === 'charge.refunded') {
+    return await handleChargeRefunded(event.data?.object, eventId);
   }
 
   await eventRef.set(
