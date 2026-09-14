@@ -225,6 +225,42 @@ function getTopupOption(optionId) {
   return TOPUP_OPTIONS.find((option) => option.id === optionId) || null;
 }
 
+/** Smallest custom top-up accepted, in microdollars ($5.00). */
+const MIN_TOPUP_MICROS = envInt('BILLING_MIN_TOPUP_MICROS', 5_000_000);
+
+/** Largest custom top-up allowed in a single checkout ($500.00). */
+const MAX_TOPUP_MICROS = envInt('BILLING_MAX_TOPUP_MICROS', 500_000_000);
+
+/**
+ * Build a synthetic top-up option for an arbitrary custom amount.
+ *
+ * The wallet no longer offers fixed chips, so the client sends a raw amount instead
+ * of an option id. The amount is snapped to whole cents because Stripe only bills
+ * whole cents; callers must persist the returned `amountMicros`, not the value the
+ * user typed, so the ledger matches what Stripe actually charged.
+ *
+ * Returns null when the amount is unusable, which callers treat as a validation
+ * failure.
+ */
+function resolveCustomTopupOption(amountMicros) {
+  const raw = Number(amountMicros);
+  if (!Number.isFinite(raw)) return null;
+
+  const cents = Math.round(raw / 10_000);
+  if (!Number.isInteger(cents) || cents <= 0) return null;
+
+  const snappedMicros = cents * 10_000;
+  if (snappedMicros < MIN_TOPUP_MICROS) return null;
+  if (snappedMicros > MAX_TOPUP_MICROS) return null;
+
+  return {
+    id: `custom_${snappedMicros}`,
+    label: `$${(snappedMicros / 1_000_000).toFixed(2)}`,
+    amountMicros: snappedMicros,
+    custom: true,
+  };
+}
+
 function getModelPricing(modelId) {
   if (!modelId) return null;
   return MODEL_PRICING[modelId] || null;
@@ -257,6 +293,9 @@ module.exports = {
   MAX_TEXT_CHARS,
   MAX_IMAGE_BASE64_CHARS,
   TOPUP_OPTIONS,
+  MIN_TOPUP_MICROS,
+  MAX_TOPUP_MICROS,
+  resolveCustomTopupOption,
   MODEL_PRICING,
   DEFAULT_MODEL_ID,
   FEATURE_BILLING,

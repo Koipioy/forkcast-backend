@@ -689,7 +689,8 @@ exports.runLLM = functions.runWith({ secrets: AI_SECRETS }).https.onRequest(asyn
  * POST /createCheckoutSession
  * Creates a one-time Stripe top-up checkout.
  *
- * Body: { optionId: "usd_10" }
+ * Body: { amountMicros: 7500000 }        // custom amount, $5.00 - $500.00
+ * Body: { optionId: "usd_10" }          // legacy fixed option, still supported
  */
 exports.createCheckoutSession = functions.runWith({ secrets: STRIPE_SECRETS }).https.onRequest(async (req, res) => {
   setCors(req, res);
@@ -713,8 +714,10 @@ exports.createCheckoutSession = functions.runWith({ secrets: STRIPE_SECRETS }).h
   }
 
   const optionId = String(req.body?.optionId || '').trim();
-  if (!optionId) {
-    badRequest(res, 'optionId is required', 'missing_option_id');
+  const amountMicros = req.body?.amountMicros;
+
+  if (!optionId && amountMicros === undefined) {
+    badRequest(res, 'amountMicros is required', 'missing_amount');
     return;
   }
 
@@ -722,7 +725,8 @@ exports.createCheckoutSession = functions.runWith({ secrets: STRIPE_SECRETS }).h
     const result = await createTopupCheckout({
       uid: authResult.uid,
       email: authResult.decoded?.email || null,
-      optionId,
+      optionId: optionId || null,
+      amountMicros,
     });
     sendJson(res, 200, {
       success: true,
@@ -732,6 +736,10 @@ exports.createCheckoutSession = functions.runWith({ secrets: STRIPE_SECRETS }).h
     console.error('createCheckoutSession failed', err);
     if (err?.code === 'invalid_option') {
       badRequest(res, 'Unknown top-up option', 'invalid_option');
+      return;
+    }
+    if (err?.code === 'invalid_amount') {
+      badRequest(res, 'Top-up amount must be between $5.00 and $500.00', 'invalid_amount');
       return;
     }
     sendJson(res, 500, {

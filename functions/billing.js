@@ -15,6 +15,7 @@ const {
   PRICING_VERSION,
   TOPUP_OPTIONS,
   getTopupOption,
+  resolveCustomTopupOption,
 } = require('./billing/config');
 const {
   centsToMicros,
@@ -88,11 +89,21 @@ async function getOrCreateStripeCustomer(uid, email) {
   return { customerId: customer.id, created: true };
 }
 
-async function createTopupCheckout({ uid, email, optionId }) {
-  const option = getTopupOption(optionId);
+async function createTopupCheckout({ uid, email, optionId, amountMicros }) {
+  // The wallet now sends a raw custom amount. `optionId` is still honoured so older
+  // installed APKs keep working until they are updated.
+  const hasCustomAmount =
+    amountMicros !== undefined && amountMicros !== null && amountMicros !== '';
+
+  const option = hasCustomAmount
+    ? resolveCustomTopupOption(amountMicros)
+    : getTopupOption(optionId);
+
   if (!option) {
-    const err = new Error('Unknown top-up option');
-    err.code = 'invalid_option';
+    const err = new Error(
+      hasCustomAmount ? 'Top-up amount is not accepted' : 'Unknown top-up option',
+    );
+    err.code = hasCustomAmount ? 'invalid_amount' : 'invalid_option';
     throw err;
   }
 
