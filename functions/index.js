@@ -1,432 +1,874 @@
+'use strict';
+
 /**
  * Firebase Cloud Functions - Main Entry Point
- * Forkcast Backend: LLM Proxy with Stripe Metered Billing
+ * Forkast prepaid AI billing backend.
+ *
+ * Core endpoints:
+ *   POST /runAI                 - server-authoritative AI call with reservation/settlement
+ *   POST /runLLM                - backward-compatible alias for /runAI
+ *   POST /createCheckoutSession - create Stripe one-time top-up checkout
+ *   POST /stripeWebhook         - process Stripe webhook events and credit top-ups
+ *   GET  /getBillingSummary     - return balance, recent ledger, top-up options
+ *   GET  /topupOptions          - return available top-up options
+ *   SCHEDULE releaseExpiredReservations - release stale reservations
  */
 
+const crypto = require('crypto');
 const functions = require('firebase-functions');
+
+const { db } = require('./firebase');
 const { getAuthenticatedUser } = require('./auth');
-const { getUser, setStripeInfo } = require('./users');
 const { callLLM } = require('./llm');
-const { reportUsage } = require('./billing');
-const { logUsage } = require('./usage');
-const { createCustomer, createMeteredSubscription, stripe } = require('./billing');
-const { auth } = require('./firebase');
 
-/**
- * POST /runLLM
- * Main endpoint for LLM requests
- * 
- * Request:
- *   Headers: Authorization: Bearer <firebase_id_token>
- *   Body: { "prompt": "..." }
- * 
- * Response:
- *   { "output": "...", "tokensUsed": 1234, "unitsReported": 1 }
- */
-exports.runLLM = functions.https.onRequest(async (req, res) => {
-  // Enable CORS
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+const {
+  DEFAULT_MODEL_ID,
+  MAX_IMAGE_BASE64_CHARS,
+  MAX_TEXT_CHARS,
+  TOPUP_OPTIONS,
+} = require('./billing/config');
+
+const {
+  calculateAiRawCostMicros,
+  calculateCharge,
+  calculateInfraRawCostMicros,
+  estimateMaxDebitMicros,
+  resolveModelPricing,
+} = require('./billing/aiCost');
+
+const {
+  InsufficientBalanceError,
+  claimReservation,
+  releaseReservation,
+  reserveBalance,
+  settleReservation,
+  storeReservationResult,
+} = require('./billing/balance');
+
+const { toSafeNumber } = require('./billing/money');
+
+const {
+  createTopupCheckout,
+  getBillingSummary,
+  processStripeEvent,
+  releaseExpiredReservations,
+} = require('./billing');
+
+const OPERATION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+function setCors(req, res) {
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const origin = req.headers.origin;
+  const allowOrigin =
+    allowedOrigins.includes('*') || (origin && allowedOrigins.includes(origin))
+      ? origin || '*'
+      : allowedOrigins[0] || '*';
+
+  res.set('Access-Control-Allow-Origin', allowOrigin);
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.set('Access-Control-Allow-Credentials', 'true');
+}
 
-  // Handle preflight
+function sendJson(res, status, payload) {
+  res.status(status).json(payload);
+}
+
+function badRequest(res, message, code = 'bad_request') {
+  sendJson(res, 400, { error: message, code });
+}
+
+function unauthorized(res) {
+  sendJson(res, 401, { error: 'Authentication required', code: 'unauthorized' });
+}
+
+function methodNotAllowed(res) {
+  sendJson(res, 405, { error: 'Method not allowed', code: 'method_not_allowed' });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientProviderError(err) {
+  const status = Number(err?.status || 0);
+  if (!status) return true; // network / unknown transport error
+  return status === 408 || status === 429 || status >= 500;
+}
+
+async function callLLMWithRetry(params, maxAttempts = 3) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await callLLM(params.prompt, params.options);
+    } catch (err) {
+      lastErr = err;
+      console.error('callLLMWithRetry attempt failed', {
+        attempt,
+        maxAttempts,
+        transient: isTransientProviderError(err),
+        message: err?.message || String(err),
+        status: err?.status || null,
+      });
+      if (!isTransientProviderError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+      await sleep(500 * attempt);
+    }
+  }
+  const err = new Error(
+    `LLM call failed: ${lastErr?.message || String(lastErr)}`,
+  );
+  err.cause = lastErr;
+  err.status = lastErr?.status || null;
+  throw err;
+}
+
+function normalizeModelSelection(body) {
+  let modelId = body.modelId || null;
+  let provider = body.provider || null;
+  let model = body.model || null;
+
+  if (!modelId && typeof model === 'string' && model.includes(':')) {
+    modelId = model;
+    provider = provider || model.split(':')[0];
+    model = null;
+  }
+
+  return { modelId, provider, model };
+}
+
+function safeNumber(value) {
+  if (value === undefined || value === null) return null;
+  try {
+    return toSafeNumber(value, 'billingValue');
+  } catch (_err) {
+    return null;
+  }
+}
+
+function billingResponseFromSettlement(settlement, charge, aiRaw, infra) {
+  return {
+    rawCostMicros: safeNumber(aiRaw + infra),
+    aiRawCostMicros: safeNumber(aiRaw),
+    infraRawCostMicros: safeNumber(infra),
+    markupBps: charge?.markupBps ?? null,
+    markupMicros: safeNumber(charge?.markupMicros ?? 0),
+    chargedMicros: safeNumber(settlement?.charge ?? charge?.chargedMicros ?? 0),
+    balanceBeforeMicros: safeNumber(settlement?.balanceBefore ?? null),
+    balanceAfterMicros: safeNumber(settlement?.balanceAfter ?? null),
+    pricingVersion: charge?.pricingVersion ?? null,
+    ledgerId: settlement?.ledgerId ?? null,
+  };
+}
+
+async function settleStoredReservation(operationId, reservation) {
+  return db.runTransaction(async (tx) => {
+    return settleReservation(db, tx, {
+      operationId,
+      actualRawCostMicros: reservation.actualRawCostMicros || 0,
+      aiRawCostMicros: reservation.aiRawCostMicros || 0,
+      infraRawCostMicros: reservation.infraRawCostMicros || 0,
+      actualMarkupMicros: reservation.actualMarkupMicros || 0,
+      actualChargedMicros: reservation.actualChargedMicros || 0,
+      feature: reservation.feature,
+      provider: reservation.provider,
+      model: reservation.model,
+      functionName: reservation.functionName || 'runAI',
+      externalRequestId: reservation.externalRequestId,
+      metadata: reservation.resultMetadata || {},
+    });
+  });
+}
+
+async function runAIHandler(req, res, options = {}) {
+  setCors(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).send('');
     return;
   }
 
-  // Only allow POST
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    methodNotAllowed(res);
     return;
   }
 
+  let authResult = null;
   try {
-    // 1. Verify Firebase ID token
-    const { uid } = await getAuthenticatedUser(req);
+    authResult = await getAuthenticatedUser(req);
+  } catch (_err) {
+    unauthorized(res);
+    return;
+  }
 
-    // 2. Extract prompt and optional provider/model from request body
-    const { prompt, provider, model } = req.body;
+  const uid = authResult.uid;
+  const email = authResult.decoded?.email || null;
+  const body = req.body || {};
 
-    if (!prompt || typeof prompt !== 'string') {
-      res.status(400).json({ error: 'Missing or invalid prompt in request body' });
+  const operationId = String(body.operationId || options.operationId || '').trim();
+  if (!OPERATION_ID_RE.test(operationId)) {
+    badRequest(
+      res,
+      'operationId is required and must match ^[A-Za-z0-9_-]{8,128}$',
+      'invalid_operation_id',
+    );
+    return;
+  }
+
+  const feature = String(body.feature || options.feature || 'unknown');
+  const rawText = body.text ?? body.prompt ?? '';
+  const imageBase64 = body.imageBase64 || null;
+
+  if (typeof rawText !== 'string') {
+    badRequest(res, 'text must be a string', 'invalid_text');
+    return;
+  }
+
+  if (imageBase64 && typeof imageBase64 !== 'string') {
+    badRequest(res, 'imageBase64 must be a string', 'invalid_image');
+    return;
+  }
+
+  const text = rawText.trim();
+  const hasImage = Boolean(imageBase64);
+
+  if (!text && !hasImage) {
+    badRequest(res, 'text or imageBase64 is required', 'missing_input');
+    return;
+  }
+
+  if (text.length > MAX_TEXT_CHARS) {
+    sendJson(res, 413, {
+      error: `Text exceeds maximum of ${MAX_TEXT_CHARS} characters`,
+      code: 'text_too_large',
+    });
+    return;
+  }
+
+  if (hasImage && imageBase64.length > MAX_IMAGE_BASE64_CHARS) {
+    sendJson(res, 413, {
+      error: `Image exceeds maximum of ${MAX_IMAGE_BASE64_CHARS} base64 characters`,
+      code: 'image_too_large',
+    });
+    return;
+  }
+
+  const { modelId, provider, model } = normalizeModelSelection(body);
+  const maxTokens = Number.isInteger(body.maxTokens) && body.maxTokens > 0 ? body.maxTokens : null;
+
+  let pricing = null;
+  try {
+    pricing =
+      resolveModelPricing({ provider, model, modelId }) ||
+      resolveModelPricing({ modelId: DEFAULT_MODEL_ID });
+  } catch (_err) {
+    pricing = null;
+  }
+
+  if (!pricing) {
+    badRequest(res, 'No configured model for this request', 'unknown_model');
+    return;
+  }
+
+  let maxDebitMicros = 0;
+  try {
+    maxDebitMicros = estimateMaxDebitMicros({
+      feature,
+      provider: pricing.provider,
+      model: pricing.model,
+      modelId: `${pricing.provider}:${pricing.model.replace(/\./g, '-')}`,
+      hasImage,
+    });
+  } catch (err) {
+    badRequest(res, `Cannot estimate cost: ${err.message}`, 'cost_estimate_failed');
+    return;
+  }
+
+  // 1. Reserve balance.
+  let reservationResult = null;
+  try {
+    reservationResult = await db.runTransaction(async (tx) =>
+      reserveBalance(db, tx, {
+        userId: uid,
+        operationId,
+        maxDebitMicros,
+        feature,
+        functionName: 'runAI',
+        email,
+      }),
+    );
+  } catch (err) {
+    if (err instanceof InsufficientBalanceError) {
+      sendJson(res, 402, {
+        error: 'Insufficient prepaid balance',
+        code: 'insufficient_balance',
+        availableBalanceMicros: err.details?.availableBalanceMicros ?? null,
+        requiredMicros: err.details?.requiredMicros ?? maxDebitMicros,
+      });
       return;
     }
+    console.error('Reservation failed', err);
+    sendJson(res, 500, { error: 'Billing reservation failed', code: 'reservation_failed' });
+    return;
+  }
 
-    // 3. Load user document from Firestore
-    const user = await getUser(uid);
+  const reservation = reservationResult.reservation || {};
 
-    if (!user) {
-      res.status(404).json({ error: 'User not found. Please create a Stripe customer first.' });
-      return;
-    }
-
-    // 4. Check for subscription item ID
-    const subscriptionItemId = user.subscriptionItemId;
-
-    if (!subscriptionItemId) {
-      res.status(400).json({ 
-        error: 'No active subscription found. Please create a Stripe customer and subscription first.' 
+  // 2. Handle existing reservation states for idempotency.
+  if (!reservationResult.created) {
+    if (reservation.status === 'settled') {
+      if (reservation.result) {
+        sendJson(res, 200, {
+          success: true,
+          idempotent: true,
+          ...reservation.result,
+          billing: {
+            rawCostMicros: reservation.actualRawCostMicros || 0,
+            aiRawCostMicros: reservation.aiRawCostMicros || 0,
+            infraRawCostMicros: reservation.infraRawCostMicros || 0,
+            markupBps: reservation.markupBps || null,
+            markupMicros: reservation.actualMarkupMicros || 0,
+            chargedMicros: reservation.actualChargedMicros || 0,
+            ledgerId: reservation.ledgerId || null,
+            pricingVersion: reservation.pricingVersion || null,
+          },
+        });
+        return;
+      }
+      sendJson(res, 409, {
+        error: 'Operation already settled without a stored result',
+        code: 'settled_without_result',
       });
       return;
     }
 
-    // 5. Call LLM API using the selected provider/model.
-    const llmResponse = await callLLM(prompt, { provider, model });
-
-    const {
-      output,
-      tokensUsed,
-      model: usedModel,
-      provider: usedProvider,
-    } = llmResponse;
-
-    // Log which provider was used
-    console.log(`LLM request completed using provider: ${usedProvider}`);
-
-    // 6. Save usage to Firestore
-    await logUsage(uid, tokensUsed, usedModel);
-
-    // 7. Convert tokens to units and report to Stripe
-    const units = Math.ceil(tokensUsed / 100000);
-    let unitsReported = 0;
-
-    if (units > 0) {
+    if (reservation.status === 'completed_unsettled') {
       try {
-        await reportUsage(subscriptionItemId, tokensUsed);
-        unitsReported = units;
-      } catch (stripeError) {
-        // Log error but don't fail the request
-        console.error('Failed to report usage to Stripe:', stripeError);
-        // Still return the response, but note the billing failure
+        const settlement = await settleStoredReservation(operationId, reservation);
+        sendJson(res, 200, {
+          success: true,
+          idempotent: true,
+          ...(reservation.result || {}),
+          billing: {
+            rawCostMicros: reservation.actualRawCostMicros || 0,
+            aiRawCostMicros: reservation.aiRawCostMicros || 0,
+            infraRawCostMicros: reservation.infraRawCostMicros || 0,
+            markupBps: reservation.markupBps || null,
+            markupMicros: reservation.actualMarkupMicros || 0,
+            chargedMicros: settlement.charge || 0,
+            balanceBeforeMicros: settlement.balanceBefore || null,
+            balanceAfterMicros: settlement.balanceAfter || null,
+            ledgerId: settlement.ledgerId || null,
+          },
+        });
+        return;
+      } catch (err) {
+        console.error('Failed to settle completed_unsettled reservation', err);
+        sendJson(res, 500, { error: 'Billing settlement failed', code: 'settlement_failed' });
+        return;
       }
     }
 
-    // 8. Return output to client
-    res.status(200).json({
-      output,
-      tokensUsed,
-      unitsReported,
-      model: usedModel,
-      provider: usedProvider, // Include which provider was used
-    });
+    if (reservation.status === 'running') {
+      sendJson(res, 409, {
+        error: 'Operation is already running',
+        code: 'operation_running',
+        status: reservation.status,
+      });
+      return;
+    }
 
-  } catch (error) {
-    console.error('Error in runLLM:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    if (reservation.status === 'released') {
+      sendJson(res, 409, {
+        error: 'Operation reservation was released',
+        code: 'operation_released',
+        status: reservation.status,
+      });
+      return;
+    }
   }
+
+  // 3. Claim the reservation to prevent duplicate provider calls.
+  let claim = null;
+  try {
+    claim = await db.runTransaction(async (tx) => claimReservation(db, tx, operationId));
+  } catch (err) {
+    console.error('Reservation claim failed', err);
+    sendJson(res, 500, { error: 'Billing reservation claim failed', code: 'claim_failed' });
+    return;
+  }
+
+  if (!claim.claimed) {
+    if (claim.reason === 'settled' && claim.reservation?.result) {
+      sendJson(res, 200, {
+        success: true,
+        idempotent: true,
+        ...claim.reservation.result,
+        billing: {
+          rawCostMicros: claim.reservation.actualRawCostMicros || 0,
+          aiRawCostMicros: claim.reservation.aiRawCostMicros || 0,
+          infraRawCostMicros: claim.reservation.infraRawCostMicros || 0,
+          markupBps: claim.reservation.markupBps || null,
+          markupMicros: claim.reservation.actualMarkupMicros || 0,
+          chargedMicros: claim.reservation.actualChargedMicros || 0,
+          ledgerId: claim.reservation.ledgerId || null,
+        },
+      });
+      return;
+    }
+
+    sendJson(res, 409, {
+      error: 'Operation is already in progress',
+      code: 'operation_in_progress',
+      status: claim.reason,
+    });
+    return;
+  }
+
+  // 4. Call provider.
+  const prompt = text || 'Analyze the provided image.';
+  let providerResult = null;
+  try {
+    providerResult = await callLLMWithRetry(
+      {
+        prompt,
+        options: {
+          provider: pricing.provider,
+          model: pricing.model,
+          maxTokens,
+          image: hasImage
+            ? {
+                base64: imageBase64,
+                mimeType: body.imageMimeType || 'image/jpeg',
+              }
+            : undefined,
+        },
+      },
+      3,
+    );
+  } catch (err) {
+    // Failed provider request: release reservation and record no charge by default.
+    let aiRaw = 0n;
+    try {
+      if (err?.usage) {
+        aiRaw = calculateAiRawCostMicros({
+          provider: pricing.provider,
+          model: pricing.model,
+          usage: err.usage,
+        }).rawCostMicros;
+      }
+    } catch (_calcErr) {
+      aiRaw = 0n;
+    }
+
+    try {
+      await db.runTransaction(async (tx) =>
+        settleReservation(db, tx, {
+          operationId,
+          actualRawCostMicros: aiRaw,
+          aiRawCostMicros: aiRaw,
+          infraRawCostMicros: 0,
+          actualMarkupMicros: 0,
+          actualChargedMicros: 0,
+          ledgerSource: 'ai',
+          ledgerType: 'no_charge',
+          ledgerStatus: 'no_charge',
+          feature,
+          provider: pricing.provider,
+          model: pricing.model,
+          functionName: 'runAI',
+          metadata: {
+            failure: true,
+            errorMessage: err?.message || 'provider_error',
+            errorStatus: err?.status || null,
+          },
+        }),
+      );
+    } catch (settleErr) {
+      console.error('Failed to settle failed provider request', settleErr);
+    }
+
+    const status = Number(err?.status || 0);
+    sendJson(res, status >= 400 && status < 600 ? status : 502, {
+      error: 'AI provider request failed',
+      code: 'provider_failed',
+      provider: pricing.provider,
+      model: pricing.model,
+    });
+    return;
+  }
+
+  if (!providerResult?.output || !String(providerResult.output).trim()) {
+    try {
+      await db.runTransaction(async (tx) =>
+        settleReservation(db, tx, {
+          operationId,
+          actualRawCostMicros: 0,
+          aiRawCostMicros: 0,
+          infraRawCostMicros: 0,
+          actualMarkupMicros: 0,
+          actualChargedMicros: 0,
+          ledgerSource: 'ai',
+          ledgerType: 'no_charge',
+          ledgerStatus: 'empty_output',
+          feature,
+          provider: providerResult?.provider || pricing.provider,
+          model: providerResult?.model || pricing.model,
+          functionName: 'runAI',
+          metadata: { emptyOutput: true },
+        }),
+      );
+    } catch (settleErr) {
+      console.error('Failed to settle empty output request', settleErr);
+    }
+
+    sendJson(res, 502, {
+      error: 'AI provider returned empty output',
+      code: 'empty_output',
+      provider: providerResult?.provider || pricing.provider,
+      model: providerResult?.model || pricing.model,
+    });
+    return;
+  }
+
+  // 5. Calculate authoritative cost.
+  let aiCost = null;
+  let infraRaw = 0n;
+  let charge = null;
+  try {
+    aiCost = calculateAiRawCostMicros({
+      provider: providerResult.provider,
+      model: providerResult.model,
+      usage: providerResult.usage,
+    });
+    infraRaw = calculateInfraRawCostMicros(feature);
+    charge = calculateCharge({ rawCostMicros: aiCost.rawCostMicros + infraRaw });
+  } catch (err) {
+    console.error('Cost calculation failed after provider success', err);
+    // Do not charge if we cannot price the response.
+    try {
+      await db.runTransaction(async (tx) =>
+        settleReservation(db, tx, {
+          operationId,
+          actualRawCostMicros: 0,
+          aiRawCostMicros: 0,
+          infraRawCostMicros: 0,
+          actualMarkupMicros: 0,
+          actualChargedMicros: 0,
+          ledgerSource: 'ai',
+          ledgerType: 'no_charge',
+          ledgerStatus: 'pricing_failed',
+          feature,
+          provider: providerResult.provider,
+          model: providerResult.model,
+          functionName: 'runAI',
+          metadata: { pricingError: err?.message || 'pricing_error' },
+        }),
+      );
+    } catch (settleErr) {
+      console.error('Failed to settle pricing-failed request', settleErr);
+    }
+
+    sendJson(res, 500, {
+      error: 'Cost calculation failed',
+      code: 'pricing_failed',
+    });
+    return;
+  }
+
+  const resultPayload = {
+    output: providerResult.output,
+    provider: providerResult.provider,
+    model: providerResult.model,
+    requestId: providerResult.providerRequestId || null,
+    usage: providerResult.usage || null,
+  };
+
+  const actual = {
+    actualRawCostMicros: aiCost.rawCostMicros + infraRaw,
+    aiRawCostMicros: aiCost.rawCostMicros,
+    infraRawCostMicros: infraRaw,
+    actualMarkupMicros: charge.markupMicros,
+    actualChargedMicros: charge.chargedMicros,
+    provider: providerResult.provider,
+    model: providerResult.model,
+    externalRequestId: providerResult.providerRequestId || null,
+    metadata: {
+      costSource: aiCost.costSource,
+      normalizedUsage: providerResult.usage || null,
+    },
+  };
+
+  // 6. Persist result before settlement so a crash can be recovered idempotently.
+  try {
+    await db.runTransaction(async (tx) =>
+      storeReservationResult(db, tx, operationId, resultPayload, actual),
+    );
+  } catch (err) {
+    console.error('Failed to store reservation result', err);
+    sendJson(res, 500, { error: 'Failed to persist AI result', code: 'store_result_failed' });
+    return;
+  }
+
+  // 7. Settle reservation and append ledger.
+  let settlement = null;
+  try {
+    settlement = await db.runTransaction(async (tx) =>
+      settleReservation(db, tx, {
+        operationId,
+        actualRawCostMicros: actual.actualRawCostMicros,
+        aiRawCostMicros: actual.aiRawCostMicros,
+        infraRawCostMicros: actual.infraRawCostMicros,
+        actualMarkupMicros: actual.actualMarkupMicros,
+        actualChargedMicros: actual.actualChargedMicros,
+        feature,
+        provider: actual.provider,
+        model: actual.model,
+        functionName: 'runAI',
+        externalRequestId: actual.externalRequestId,
+        metadata: actual.metadata,
+      }),
+    );
+  } catch (err) {
+    console.error('Settlement failed after result stored', err);
+    sendJson(res, 500, {
+      error: 'Billing settlement failed. Retry the same operationId to settle.',
+      code: 'settlement_failed',
+    });
+    return;
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    ...resultPayload,
+    billing: billingResponseFromSettlement(
+      settlement,
+      charge,
+      aiCost.rawCostMicros,
+      infraRaw,
+    ),
+  });
+}
+
+/**
+ * POST /runAI
+ */
+exports.runAI = functions.https.onRequest(async (req, res) => {
+  await runAIHandler(req, res, { feature: 'unknown' });
 });
 
 /**
- * POST /createStripeCustomer
- * Creates a Stripe customer and metered subscription
- * 
- * Request:
- *   Headers: Authorization: Bearer <firebase_id_token>
- * 
- * Response:
- *   { "customer": {...}, "subscription": {...}, "subscriptionItem": {...} }
+ * POST /runLLM
+ * Backward-compatible alias. New clients should use /runAI with an operationId.
  */
-exports.createStripeCustomer = functions.https.onRequest(async (req, res) => {
-  // Enable CORS
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-  // Handle preflight
-  if (req.method === 'OPTIONS') {
-    res.status(204).send('');
-    return;
-  }
-
-  // Only allow POST
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    return;
-  }
-
-  try {
-    // 1. Verify Firebase ID token
-    const { uid, decoded } = await getAuthenticatedUser(req);
-
-    // 2. Get user email from token
-    const email = decoded.email;
-
-    if (!email) {
-      res.status(400).json({ error: 'User email not found in token' });
-      return;
-    }
-
-    // 3. Check if user already has Stripe customer
-    const existingUser = await getUser(uid);
-    if (existingUser?.stripeCustomerId) {
-      res.status(400).json({ 
-        error: 'User already has a Stripe customer',
-        customerId: existingUser.stripeCustomerId
-      });
-      return;
-    }
-
-    // 4. Create Stripe customer
-    const customer = await createCustomer(email, uid);
-
-    // 5. Store customer ID in Firestore
-    await setStripeInfo(uid, customer.id, null, null);
-
-    // 6. Try to create metered subscription if STRIPE_PRICE is configured
-    // This is optional - for checkout session flow, subscription will be created via checkout
-    let subscription = null;
-    let subscriptionItem = null;
-    
-    const STRIPE_PRICE = process.env.STRIPE_PRICE || functions.config().stripe?.price;
-    if (STRIPE_PRICE) {
-      try {
-        const result = await createMeteredSubscription(customer.id);
-        subscription = result.subscription;
-        subscriptionItem = result.subscriptionItem;
-        
-        // Update Firestore with subscription info
-        await setStripeInfo(
-          uid,
-          customer.id,
-          subscription.id,
-          subscriptionItem.id
-        );
-      } catch (error) {
-        // If subscription creation fails, that's okay - customer is still created
-        console.warn('Could not create metered subscription (this is okay for checkout flow):', error.message);
-      }
-    }
-
-    // 7. Return customer and subscription info (if created)
-    const response = {
-      customer: {
-        id: customer.id,
-        email: customer.email
-      }
-    };
-    
-    if (subscription && subscriptionItem) {
-      response.subscription = {
-        id: subscription.id,
-        status: subscription.status
-      };
-      response.subscriptionItem = {
-        id: subscriptionItem.id,
-        price: subscriptionItem.price.id
-      };
-    }
-    
-    res.status(200).json(response);
-
-  } catch (error) {
-    console.error('Error in createStripeCustomer:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
-  }
+exports.runLLM = functions.https.onRequest(async (req, res) => {
+  const generatedOperationId = `legacy_${crypto.randomUUID().replace(/-/g, '')}`;
+  await runAIHandler(req, res, {
+    feature: req.body?.feature || 'unknown',
+    operationId: req.body?.operationId || generatedOperationId,
+  });
 });
 
 /**
  * POST /createCheckoutSession
- * Creates a Stripe Checkout Session for subscription
- * 
- * Request:
- *   Headers: Authorization: Bearer <firebase_id_token>
- *   Body: {
- *     "priceId": "price_...", // Required
- *     "successUrl": "forkcast://subscription-success", // Optional
- *     "cancelUrl": "forkcast://subscription-cancel" // Optional
- *   }
- * 
- * Response:
- *   { "success": true, "url": "https://checkout.stripe.com/...", "sessionId": "cs_..." }
+ * Creates a one-time Stripe top-up checkout.
+ *
+ * Body: { optionId: "usd_10" }
  */
 exports.createCheckoutSession = functions.https.onRequest(async (req, res) => {
-  // Enable CORS
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  setCors(req, res);
 
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     res.status(204).send('');
     return;
   }
 
-  // Only allow POST
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    methodNotAllowed(res);
+    return;
+  }
+
+  let authResult = null;
+  try {
+    authResult = await getAuthenticatedUser(req);
+  } catch (_err) {
+    unauthorized(res);
+    return;
+  }
+
+  const optionId = String(req.body?.optionId || '').trim();
+  if (!optionId) {
+    badRequest(res, 'optionId is required', 'missing_option_id');
     return;
   }
 
   try {
-    // 1. Verify Firebase ID token
-    const { uid, decoded } = await getAuthenticatedUser(req);
-
-    // 2. Get request body
-    const { priceId, successUrl, cancelUrl } = req.body || {};
-
-    if (!priceId) {
-      res.status(400).json({ error: 'Bad request', message: 'priceId is required' });
-      return;
-    }
-
-    // 3. Check if Stripe is configured
-    if (!stripe) {
-      res.status(500).json({ 
-        error: 'Configuration error',
-        message: 'Stripe secret key not configured. Please set it with: firebase functions:config:set stripe.secret="sk_test_..."'
-      });
-      return;
-    }
-
-    // 4. Get or create Stripe customer
-    const user = await getUser(uid);
-    
-    let customerId;
-    if (user?.stripeCustomerId) {
-      customerId = user.stripeCustomerId;
-    } else {
-      // Create customer if doesn't exist
-      const email = decoded.email;
-      if (!email) {
-        res.status(400).json({ error: 'User email not found in token' });
-        return;
-      }
-      
-      const customer = await createCustomer(email, uid);
-      customerId = customer.id;
-      
-      // Save customer ID to Firestore
-      await setStripeInfo(uid, customerId, null, null);
-    }
-
-    // 5. Create Checkout Session
-    const session = await stripe.checkout.sessions.create({
-      customer: customerId,
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      mode: 'subscription',
-      success_url: successUrl || 'forkcast://subscription-success',
-      cancel_url: cancelUrl || 'forkcast://subscription-cancel',
-      metadata: {
-        firebaseUID: uid,
-      },
+    const result = await createTopupCheckout({
+      uid: authResult.uid,
+      email: authResult.decoded?.email || null,
+      optionId,
     });
-
-    // 6. Return checkout session URL
-    res.status(200).json({
+    sendJson(res, 200, {
       success: true,
-      url: session.url,
-      sessionId: session.id,
+      ...result,
     });
-
-  } catch (error) {
-    console.error('Error creating checkout session:', error);
-    
-    // Handle specific Stripe errors
-    if (error.type === 'StripeInvalidRequestError') {
-      return res.status(400).json({ 
-        error: 'Invalid request',
-        message: error.message 
-      });
+  } catch (err) {
+    console.error('createCheckoutSession failed', err);
+    if (err?.code === 'invalid_option') {
+      badRequest(res, 'Unknown top-up option', 'invalid_option');
+      return;
     }
-    
-    return res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
+    sendJson(res, 500, {
+      error: 'Failed to create top-up checkout',
+      code: 'checkout_failed',
     });
   }
 });
 
 /**
  * POST /stripeWebhook
- * Handles Stripe webhook events
- * 
- * This endpoint should be configured in Stripe Dashboard:
- * https://dashboard.stripe.com/webhooks
- * 
- * Events handled:
- * - invoice.paid
- * - customer.subscription.updated
- * - customer.subscription.deleted
- * 
- * Note: For webhook signature verification, we need raw body.
- * Firebase Functions v1 automatically provides req.rawBody.
  */
 exports.stripeWebhook = functions.https.onRequest(async (req, res) => {
-  const sig = req.headers['stripe-signature'];
+  setCors(req, res);
 
-  if (!sig) {
-    res.status(400).json({ error: 'Missing stripe-signature header' });
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
     return;
   }
 
-  // Get webhook secret from environment
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || 
-                       functions.config().stripe?.webhook_secret;
-
-  if (!webhookSecret) {
-    console.error('STRIPE_WEBHOOK_SECRET not configured');
-    res.status(500).json({ error: 'Webhook secret not configured' });
+  if (req.method !== 'POST') {
+    methodNotAllowed(res);
     return;
   }
 
-  let event;
+  const signature = req.headers['stripe-signature'];
+  if (!signature) {
+    badRequest(res, 'Missing stripe-signature header', 'missing_signature');
+    return;
+  }
 
   try {
-    // Verify webhook signature
-    // req.rawBody is available in Firebase Functions v1
-    // For v2, you'd need to use express.raw() middleware
-    const rawBody = req.rawBody || JSON.stringify(req.body);
-    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    res.status(400).json({ error: `Webhook Error: ${err.message}` });
-    return;
-  }
+    const stripe = require('./billing').getStripe();
+    const webhookSecret =
+      process.env.STRIPE_WEBHOOK_SECRET ||
+      functions.config().stripe?.webhook_secret;
 
-  // Handle the event
-  try {
-    switch (event.type) {
-      case 'invoice.paid':
-        const invoice = event.data.object;
-        console.log('Invoice paid:', invoice.id);
-        // You can add custom logic here, e.g., update user status
-        break;
-
-      case 'customer.subscription.updated':
-        const subscription = event.data.object;
-        console.log('Subscription updated:', subscription.id);
-        // You can add custom logic here, e.g., sync subscription status to Firestore
-        break;
-
-      case 'customer.subscription.deleted':
-        const deletedSubscription = event.data.object;
-        console.log('Subscription deleted:', deletedSubscription.id);
-        // You can add custom logic here, e.g., mark user as inactive
-        break;
-
-      default:
-        console.log(`Unhandled event type: ${event.type}`);
+    if (!webhookSecret) {
+      console.error('STRIPE_WEBHOOK_SECRET is not configured');
+      sendJson(res, 500, {
+        error: 'Stripe webhook secret is not configured',
+        code: 'webhook_secret_missing',
+      });
+      return;
     }
 
-    // Return a response to acknowledge receipt of the event
-    res.status(200).json({ received: true });
-
-  } catch (error) {
-    console.error('Error handling webhook:', error);
-    res.status(500).json({ error: 'Error processing webhook' });
+    const event = stripe.webhooks.constructEvent(req.rawBody, signature, webhookSecret);
+    const result = await processStripeEvent(event);
+    sendJson(res, 200, {
+      received: true,
+      ...result,
+    });
+  } catch (err) {
+    console.error('stripeWebhook failed', err);
+    sendJson(res, 400, {
+      error: 'Webhook signature verification failed',
+      code: 'invalid_signature',
+    });
   }
 });
 
+/**
+ * GET /getBillingSummary
+ */
+exports.getBillingSummary = functions.https.onRequest(async (req, res) => {
+  setCors(req, res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    methodNotAllowed(res);
+    return;
+  }
+
+  let authResult = null;
+  try {
+    authResult = await getAuthenticatedUser(req);
+  } catch (_err) {
+    unauthorized(res);
+    return;
+  }
+
+  try {
+    const summary = await getBillingSummary(authResult.uid);
+    sendJson(res, 200, {
+      success: true,
+      ...summary,
+    });
+  } catch (err) {
+    console.error('getBillingSummary failed', err);
+    sendJson(res, 500, {
+      error: 'Failed to load billing summary',
+      code: 'summary_failed',
+    });
+  }
+});
+
+/**
+ * GET /topupOptions
+ */
+exports.topupOptions = functions.https.onRequest(async (req, res) => {
+  setCors(req, res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    options: TOPUP_OPTIONS,
+  });
+});
+
+/**
+ * Scheduled cleanup for stale reservations.
+ */
+exports.releaseExpiredReservations = functions.pubsub
+  .schedule('every 10 minutes')
+  .onRun(async () => {
+    try {
+      const result = await releaseExpiredReservations(100);
+      console.log('releaseExpiredReservations completed', result);
+    } catch (err) {
+      console.error('releaseExpiredReservations failed', err);
+    }
+  });
+
+/**
+ * GET /health
+ */
+exports.health = functions.https.onRequest(async (req, res) => {
+  setCors(req, res);
+  const cfg = functions.config();
+  sendJson(res, 200, {
+    ok: true,
+    service: 'forkcast-backend',
+    pricingVersion: require('./billing/config').PRICING_VERSION,
+    config: {
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY || cfg.openai?.key),
+      hasAnthropicKey: Boolean(process.env.ANTHROPIC_API_KEY || cfg.anthropic?.key),
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY || cfg.gemini?.key),
+      hasStripeSecret: Boolean(process.env.STRIPE_SECRET || cfg.stripe?.secret),
+      hasStripeWebhookSecret: Boolean(
+        process.env.STRIPE_WEBHOOK_SECRET || cfg.stripe?.webhook_secret,
+      ),
+    },
+  });
+});

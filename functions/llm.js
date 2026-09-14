@@ -1,10 +1,15 @@
+'use strict';
+
 /**
- * LLM Proxy utilities
- * Handles communication with LLM providers (OpenAI, Anthropic, Google).
+ * LLM proxy utilities.
+ *
+ * Handles communication with LLM providers and returns normalized usage data
+ * for the billing layer.
  */
 
 const OpenAI = require('openai');
 const functions = require('firebase-functions');
+const { DEFAULT_MODEL_ID } = require('./billing/config');
 
 const PROVIDERS = ['openai', 'anthropic', 'google'];
 
@@ -51,8 +56,23 @@ if (OPENAI_KEY) {
   });
 }
 
+function defaultModelParts() {
+  // DEFAULT_MODEL_ID is a catalog id like "openai:gpt-5-6-luna".
+  // The API model is stored in billing config, e.g. "gpt-5.6-luna".
+  try {
+    const { getModelPricing } = require('./billing/config');
+    const pricing = getModelPricing(DEFAULT_MODEL_ID);
+    if (pricing?.provider && pricing?.model) {
+      return { provider: pricing.provider, model: pricing.model };
+    }
+  } catch (_err) {
+    // Fall through to conservative default.
+  }
+  return { provider: 'openai', model: 'gpt-5.6-luna' };
+}
+
 function getDefaultModel() {
-  return 'gpt-4o-mini';
+  return defaultModelParts().model;
 }
 
 function isProvider(value) {
@@ -72,47 +92,129 @@ function normalizeProvider(provider, model) {
   if (isProvider(provider)) return provider;
   const inferred = inferProvider(model);
   if (inferred) return inferred;
-  return 'openai';
+  return defaultModelParts().provider;
 }
 
 function trimTrailingSlash(value) {
   return String(value).replace(/\/$/, '');
 }
 
-async function callOpenAI(prompt, model = null) {
+function normalizeOpenAIUsage(usage) {
+  const u = usage || {};
+  return {
+    inputTokens: Number(u.prompt_tokens || 0),
+    outputTokens: Number(u.completion_tokens || 0),
+    cachedInputTokens: Number(u.prompt_tokens_details?.cached_tokens || 0),
+    reasoningTokens: Number(u.completion_tokens_details?.reasoning_tokens || 0),
+    totalTokens: Number(u.total_tokens || 0),
+  };
+}
+
+function normalizeAnthropicUsage(usage) {
+  const u = usage || {};
+  const cacheCreation = Number(u.cache_creation_input_tokens || 0);
+  const cacheRead = Number(u.cache_read_input_tokens || 0);
+  const baseInput = Number(u.input_tokens || 0);
+  return {
+    // Treat cache creation as ordinary input and cache reads as cached input.
+    inputTokens: baseInput + cacheCreation + cacheRead,
+    outputTokens: Number(u.output_tokens || 0),
+    cachedInputTokens: cacheRead,
+    reasoningTokens: 0,
+    totalTokens: baseInput + cacheCreation + cacheRead + Number(u.output_tokens || 0),
+  };
+}
+
+function normalizeGoogleUsage(usageMetadata) {
+  const u = usageMetadata || {};
+  return {
+    inputTokens: Number(u.promptTokenCount || 0),
+    outputTokens: Number(u.candidatesTokenCount || 0),
+    cachedInputTokens: Number(u.cachedContentTokenCount || 0),
+    reasoningTokens: Number(u.thoughtsTokenCount || 0),
+    totalTokens: Number(u.totalTokenCount || 0),
+  };
+}
+
+function buildOpenAIContent(prompt, image) {
+  if (!image) return prompt;
+  const mimeType = image.mimeType || 'image/jpeg';
+  return [
+    { type: 'text', text: prompt },
+    {
+      type: 'image_url',
+      image_url: {
+        url: `data:${mimeType};base64,${image.base64}`,
+      },
+    },
+  ];
+}
+
+function buildAnthropicContent(prompt, image) {
+  if (!image) return prompt;
+  return [
+    { type: 'text', text: prompt },
+    {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: image.mimeType || 'image/jpeg',
+        data: image.base64,
+      },
+    },
+  ];
+}
+
+function buildGoogleContent(prompt, image) {
+  const parts = [{ text: prompt }];
+  if (image) {
+    parts.push({
+      inlineData: {
+        mimeType: image.mimeType || 'image/jpeg',
+        data: image.base64,
+      },
+    });
+  }
+  return [{ role: 'user', parts }];
+}
+
+async function callOpenAI(prompt, model = null, options = {}) {
   if (!openaiClient) {
     throw new Error('OpenAI client not initialized. Check OPENAI_API_KEY configuration.');
   }
 
   const modelToUse = model || getDefaultModel();
 
-  try {
-    const response = await openaiClient.chat.completions.create({
-      model: modelToUse,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      temperature: 0.7,
-    });
+  const body = {
+    model: modelToUse,
+    messages: [
+      {
+        role: 'user',
+        content: buildOpenAIContent(prompt, options.image),
+      },
+    ],
+  };
 
-    const output = response.choices?.[0]?.message?.content || '';
-    const tokensUsed = response.usage?.total_tokens || 0;
-
-    return {
-      output,
-      tokensUsed,
-      model: modelToUse,
-      provider: 'openai',
-    };
-  } catch (error) {
-    throw new Error(`OpenAI API error: ${error.message}`);
+  if (options.maxTokens) {
+    body.max_tokens = options.maxTokens;
   }
+
+  const response = await openaiClient.chat.completions.create(body);
+
+  const output = response.choices?.[0]?.message?.content || '';
+  const usage = normalizeOpenAIUsage(response.usage);
+
+  return {
+    output,
+    usage,
+    providerRequestId: response.id || null,
+    model: modelToUse,
+    provider: 'openai',
+    raw: response,
+  };
 }
 
-async function callAnthropic(prompt, model) {
+async function callAnthropic(prompt, model, options = {}) {
   if (!ANTHROPIC_KEY) {
     throw new Error('Anthropic API key is not configured. Set ANTHROPIC_API_KEY.');
   }
@@ -131,11 +233,11 @@ async function callAnthropic(prompt, model) {
     },
     body: JSON.stringify({
       model,
-      max_tokens: 4096,
+      max_tokens: options.maxTokens || 4096,
       messages: [
         {
           role: 'user',
-          content: prompt,
+          content: buildAnthropicContent(prompt, options.image),
         },
       ],
     }),
@@ -155,7 +257,9 @@ async function callAnthropic(prompt, model) {
       data?.message ||
       raw ||
       `Anthropic API error (${response.status})`;
-    throw new Error(`Anthropic API error: ${message}`);
+    const err = new Error(`Anthropic API error: ${message}`);
+    err.status = response.status;
+    throw err;
   }
 
   const output = Array.isArray(data?.content)
@@ -164,18 +268,19 @@ async function callAnthropic(prompt, model) {
         .map((block) => block.text || '')
         .join('')
     : '';
-  const tokensUsed =
-    (data?.usage?.input_tokens || 0) + (data?.usage?.output_tokens || 0);
+  const usage = normalizeAnthropicUsage(data?.usage);
 
   return {
     output,
-    tokensUsed,
+    usage,
+    providerRequestId: data?.id || null,
     model,
     provider: 'anthropic',
+    raw: data,
   };
 }
 
-async function callGoogle(prompt, model) {
+async function callGoogle(prompt, model, options = {}) {
   if (!GEMINI_KEY) {
     throw new Error('Gemini API key is not configured. Set GEMINI_API_KEY.');
   }
@@ -184,8 +289,18 @@ async function callGoogle(prompt, model) {
   }
 
   const baseUrl = trimTrailingSlash(
-    GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta'
+    GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
   );
+
+  const body = {
+    contents: buildGoogleContent(prompt, options.image),
+  };
+
+  if (options.maxTokens) {
+    body.generationConfig = {
+      maxOutputTokens: options.maxTokens,
+    };
+  }
 
   const response = await fetch(
     `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_KEY)}`,
@@ -194,15 +309,8 @@ async function callGoogle(prompt, model) {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: prompt }],
-          },
-        ],
-      }),
-    }
+      body: JSON.stringify(body),
+    },
   );
 
   const raw = await response.text();
@@ -219,7 +327,9 @@ async function callGoogle(prompt, model) {
       data?.message ||
       raw ||
       `Google Gemini API error (${response.status})`;
-    throw new Error(`Google Gemini API error: ${message}`);
+    const err = new Error(`Google Gemini API error: ${message}`);
+    err.status = response.status;
+    throw err;
   }
 
   const output = Array.isArray(data?.candidates?.[0]?.content?.parts)
@@ -227,37 +337,53 @@ async function callGoogle(prompt, model) {
         .map((part) => part?.text || '')
         .join('')
     : '';
-  const tokensUsed = data?.usageMetadata?.totalTokenCount || 0;
+  const usage = normalizeGoogleUsage(data?.usageMetadata);
 
   return {
     output,
-    tokensUsed,
+    usage,
+    providerRequestId: data?.responseId || data?.response?.responseId || null,
     model,
     provider: 'google',
+    raw: data,
   };
 }
 
 /**
  * Main LLM call function.
+ *
  * Routes to the selected provider, or infers the provider from the model name.
  *
  * @param {string} prompt
- * @param {{provider?: string, model?: string}} options
- * @returns {Promise<{output: string, tokensUsed: number, model: string, provider: string}>}
+ * @param {{provider?: string, model?: string, image?: {base64: string, mimeType?: string}, maxTokens?: number}} options
+ * @returns {Promise<{output: string, usage: object, providerRequestId: string|null, model: string, provider: string}>}
  */
-async function callLLM(prompt, options = {}) {
+async function callLLMInternal(prompt, options = {}) {
   const provider = normalizeProvider(options.provider, options.model);
-  const model = options.model || (provider === 'openai' ? getDefaultModel() : undefined);
+  const model = options.model || (provider === defaultModelParts().provider ? defaultModelParts().model : undefined);
 
   if (provider === 'anthropic') {
-    return await callAnthropic(prompt, model);
+    return await callAnthropic(prompt, model, options);
   }
 
   if (provider === 'google') {
-    return await callGoogle(prompt, model);
+    return await callGoogle(prompt, model, options);
   }
 
-  return await callOpenAI(prompt, model);
+  return await callOpenAI(prompt, model, options);
+}
+
+async function callLLM(prompt, options = {}) {
+  try {
+    return await callLLMInternal(prompt, options);
+  } catch (err) {
+    if (err && typeof err === 'object') {
+      throw err;
+    }
+    const wrapped = new Error(`callLLM threw a non-error value: ${String(err)}`);
+    wrapped.cause = err;
+    throw wrapped;
+  }
 }
 
 module.exports = {
@@ -267,4 +393,7 @@ module.exports = {
   callGoogle,
   getDefaultModel,
   normalizeProvider,
+  normalizeOpenAIUsage,
+  normalizeAnthropicUsage,
+  normalizeGoogleUsage,
 };
