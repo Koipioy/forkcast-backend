@@ -3,7 +3,12 @@
 const { toSafeNumber } = require('./money');
 const { appendLedgerEntry } = require('./ledger');
 const { increment } = require('./firestoreValue');
-const { isEnforcementEnabled, PRICING_VERSION, RESERVATION_TTL_MS } = require('./config');
+const {
+  INITIAL_BALANCE_MICROS,
+  isEnforcementEnabled,
+  PRICING_VERSION,
+  RESERVATION_TTL_MS,
+} = require('./config');
 
 class InsufficientBalanceError extends Error {
   constructor(details) {
@@ -36,7 +41,7 @@ async function ensureUserDoc(db, tx, userId, email) {
   if (!snap.exists) {
     const data = {
       uid: userId,
-      availableBalanceMicros: 0,
+      availableBalanceMicros: INITIAL_BALANCE_MICROS,
       reservedBalanceMicros: 0,
       lifetimeTopupMicros: 0,
       lifetimeChargedMicros: 0,
@@ -109,7 +114,7 @@ async function reserveBalance(db, tx, params) {
   const userData = userSnap.data() || {};
   const available = Number(userData.availableBalanceMicros || 0);
 
-  if (available < maxDebit) {
+  if (available <= 0) {
     throw new InsufficientBalanceError({
       userId,
       availableBalanceMicros: available,
@@ -117,11 +122,20 @@ async function reserveBalance(db, tx, params) {
     });
   }
 
+  // If the user has some money but not enough for the full estimated maximum,
+  // reserve what they have instead of blocking the call outright. Settlement is
+  // capped by this reserved amount, so the account floors at $0.00 instead of
+  // going negative.
+  const reserveAmount = Math.min(maxDebit, available);
+  const partialReservation = reserveAmount < maxDebit;
+
   const reservation = {
     id: operationId,
     userId,
     status: 'reserved',
-    maxDebitMicros: maxDebit,
+    maxDebitMicros: reserveAmount,
+    requestedMaxDebitMicros: maxDebit,
+    partialReservation,
     feature: feature || 'unknown',
     functionName: functionName || 'unknown',
     createdAt: now,
@@ -131,8 +145,8 @@ async function reserveBalance(db, tx, params) {
 
   await userRef(db, userId).set(
     {
-      availableBalanceMicros: increment(db, -maxDebit),
-      reservedBalanceMicros: increment(db, maxDebit),
+      availableBalanceMicros: increment(db, -reserveAmount),
+      reservedBalanceMicros: increment(db, reserveAmount),
       updatedAt: now,
     },
     { merge: true },

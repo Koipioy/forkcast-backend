@@ -11,6 +11,7 @@
 const Stripe = require('stripe');
 const { db } = require('./firebase');
 const {
+  INITIAL_BALANCE_MICROS,
   PAYMENT_FEE_ESTIMATE,
   PRICING_VERSION,
   TOPUP_OPTIONS,
@@ -499,7 +500,23 @@ async function processStripeEvent(event) {
 async function getBillingSummary(uid) {
   const userRef = db.collection('users').doc(String(uid));
   const snap = await userRef.get();
-  const user = snap.data() || {};
+  let user = snap.data() || {};
+
+  if (!snap.exists) {
+    const now = Date.now();
+    user = {
+      uid: String(uid),
+      availableBalanceMicros: INITIAL_BALANCE_MICROS,
+      reservedBalanceMicros: 0,
+      lifetimeTopupMicros: 0,
+      lifetimeChargedMicros: 0,
+      lifetimeRefundedMicros: 0,
+      lifetimeAdjustmentMicros: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await userRef.set(user);
+  }
 
   const ledgerQuery = await db
     .collection('billingLedger')

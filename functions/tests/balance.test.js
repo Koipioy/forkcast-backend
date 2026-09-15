@@ -6,10 +6,12 @@ const assert = require('node:assert');
 const {
   InsufficientBalanceError,
   claimReservation,
+  ensureUserDoc,
   releaseReservation,
   reserveBalance,
   settleReservation,
 } = require('../billing/balance');
+const { INITIAL_BALANCE_MICROS } = require('../billing/config');
 
 function makeFakeDb() {
   const store = {
@@ -80,6 +82,18 @@ function makeFakeDb() {
   };
 }
 
+test('ensureUserDoc creates a new account with the starting AI credit', async () => {
+  const db = makeFakeDb();
+
+  await ensureUserDoc(db, {}, 'u_new', 'new@example.com');
+
+  const user = db.store.users.get('u_new');
+  assert.ok(user);
+  assert.strictEqual(user.availableBalanceMicros, INITIAL_BALANCE_MICROS);
+  assert.strictEqual(user.availableBalanceMicros, 100_000);
+  assert.strictEqual(user.reservedBalanceMicros, 0);
+});
+
 test('reserveBalance moves available balance into reserved balance', async () => {
   const db = makeFakeDb();
   await db.collection('users').doc('u1').set({
@@ -107,10 +121,10 @@ test('reserveBalance moves available balance into reserved balance', async () =>
   assert.strictEqual(reservation.maxDebitMicros, 500);
 });
 
-test('reserveBalance throws insufficient balance', async () => {
+test('reserveBalance throws insufficient balance when no money is available', async () => {
   const db = makeFakeDb();
   await db.collection('users').doc('u1').set({
-    availableBalanceMicros: 100,
+    availableBalanceMicros: 0,
     reservedBalanceMicros: 0,
   });
 
@@ -123,6 +137,32 @@ test('reserveBalance throws insufficient balance', async () => {
       }),
     InsufficientBalanceError,
   );
+});
+
+test('reserveBalance partially reserves the remaining balance instead of blocking', async () => {
+  const db = makeFakeDb();
+  await db.collection('users').doc('u1').set({
+    availableBalanceMicros: 100,
+    reservedBalanceMicros: 0,
+  });
+
+  const result = await reserveBalance(db, {}, {
+    userId: 'u1',
+    operationId: 'op_partial_1',
+    maxDebitMicros: 500,
+  });
+
+  assert.strictEqual(result.created, true);
+  assert.strictEqual(result.status, 'reserved');
+
+  const user = db.store.users.get('u1');
+  assert.strictEqual(user.availableBalanceMicros, 0);
+  assert.strictEqual(user.reservedBalanceMicros, 100);
+
+  const reservation = db.store.billingReservations.get('op_partial_1');
+  assert.strictEqual(reservation.maxDebitMicros, 100);
+  assert.strictEqual(reservation.requestedMaxDebitMicros, 500);
+  assert.strictEqual(reservation.partialReservation, true);
 });
 
 test('settleReservation releases unused reservation and charges actual amount', async () => {
@@ -186,6 +226,40 @@ test('settleReservation caps charge at reserved max and records uncollectible', 
   assert.strictEqual(ledger[0].chargedMicros, 300);
   assert.strictEqual(ledger[0].metadata.requestedChargedMicros, 500);
   assert.strictEqual(ledger[0].metadata.uncollectibleMicros, 200);
+});
+
+test('settleReservation floors the balance at zero for a partial reservation', async () => {
+  const db = makeFakeDb();
+  await db.collection('users').doc('u1').set({
+    availableBalanceMicros: 100,
+    reservedBalanceMicros: 0,
+    lifetimeChargedMicros: 0,
+  });
+
+  await reserveBalance(db, {}, {
+    userId: 'u1',
+    operationId: 'op_partial_1',
+    maxDebitMicros: 500,
+  });
+
+  const settlement = await settleReservation(db, {}, {
+    operationId: 'op_partial_1',
+    actualChargedMicros: 500,
+  });
+
+  assert.strictEqual(settlement.charge, 100);
+  assert.strictEqual(settlement.balanceBefore, 100);
+  assert.strictEqual(settlement.balanceAfter, 0);
+
+  const user = db.store.users.get('u1');
+  assert.strictEqual(user.availableBalanceMicros, 0);
+  assert.strictEqual(user.reservedBalanceMicros, 0);
+  assert.strictEqual(user.lifetimeChargedMicros, 100);
+
+  const ledger = [...db.store.billingLedger.values()];
+  assert.strictEqual(ledger[0].chargedMicros, 100);
+  assert.strictEqual(ledger[0].metadata.requestedChargedMicros, 500);
+  assert.strictEqual(ledger[0].metadata.uncollectibleMicros, 400);
 });
 
 test('releaseReservation returns reserved balance to available', async () => {

@@ -35,6 +35,14 @@ const RESERVATION_TTL_MS = envInt('BILLING_RESERVATION_TTL_MS', 30 * 60 * 1000);
 const MAX_TEXT_CHARS = envInt('BILLING_MAX_TEXT_CHARS', 100_000);
 const MAX_IMAGE_BASE64_CHARS = envInt('BILLING_MAX_IMAGE_BASE64_CHARS', 8_000_000);
 
+/**
+ * New accounts start with a tiny amount of prepaid AI credit.
+ *
+ * $0.10 is enough for a few small AI calls, but not enough to hide the fact
+ * that AI usage is metered. Existing accounts are never topped up automatically.
+ */
+const INITIAL_BALANCE_MICROS = envInt('BILLING_INITIAL_BALANCE_MICROS', 100_000);
+
 const TOPUP_OPTIONS = [
   {
     id: 'usd_5',
@@ -289,6 +297,7 @@ module.exports = {
   PRICING_VERSION,
   DEFAULT_MARKUP_BPS: DEFAULT_MARKUP,
   BILLING_ENFORCEMENT,
+  INITIAL_BALANCE_MICROS,
   RESERVATION_TTL_MS,
   MAX_TEXT_CHARS,
   MAX_IMAGE_BASE64_CHARS,
