@@ -266,6 +266,7 @@ async function settleReservation(db, tx, params) {
       actualRawCostMicros: toSafeNumber(actualRawCostMicros || 0, 'actualRawCostMicros'),
       actualMarkupMicros: toSafeNumber(actualMarkupMicros || 0, 'actualMarkupMicros'),
       actualChargedMicros: 0,
+      failureRecorded: metadata && metadata.failure === true ? true : null,
       skippedReason: reservation.skippedReason || 'billing_enforcement_off',
     });
     return { alreadySettled: false, skipped: true, reservation: { ...reservation, status: 'settled' } };
@@ -342,6 +343,7 @@ async function settleReservation(db, tx, params) {
     actualMarkupMicros: toSafeNumber(actualMarkupMicros || 0, 'actualMarkupMicros'),
     actualChargedMicros: charge,
     ledgerId: ledgerResult.id,
+    failureRecorded: metadata && metadata.failure === true ? true : null,
   });
 
   return {
@@ -398,6 +400,42 @@ async function releaseReservation(db, tx, params) {
   return { released: true, reservation: { ...reservation, status: 'released' } };
 }
 
+/**
+ * A reservation settled as a provider failure with zero charge is not a completed
+ * operation - it is an attempt that never produced anything.
+ *
+ * operationIds are single-use by design, so leaving such a reservation in place
+ * answers every subsequent retry with `settled_without_result` and permanently
+ * poisons the operation: the user can never retry a call that failed for a
+ * transient reason such as a provider 503.
+ *
+ * Clear the reservation so the caller can re-reserve and run again. Only the
+ * narrow zero-charge failure case qualifies. The ledger entry written at failure
+ * time is a separate document and keeps the audit trail, and settleReservation has
+ * already returned the reserved amount to the available balance, so deleting this
+ * document strands nothing.
+ */
+async function clearRetryableFailedReservation(db, operationId) {
+  if (!operationId) return { cleared: false, reason: 'no_operation_id' };
+
+  const ref = reservationRef(db, operationId);
+  const snap = await ref.get();
+  if (!snap.exists) return { cleared: false, reason: 'not_found' };
+
+  const data = snap.data() || {};
+  if (data.status !== 'settled') return { cleared: false, reason: 'not_settled' };
+  if (data.result) return { cleared: false, reason: 'has_result' };
+  if (Number(data.actualChargedMicros || 0) > 0) {
+    return { cleared: false, reason: 'charged' };
+  }
+  if (data.failureRecorded !== true) {
+    return { cleared: false, reason: 'not_a_recorded_failure' };
+  }
+
+  await ref.delete();
+  return { cleared: true, reason: 'retryable_failure', operationId: String(operationId) };
+}
+
 module.exports = {
   InsufficientBalanceError,
   ReservationConflictError,
@@ -408,4 +446,5 @@ module.exports = {
   storeReservationResult,
   settleReservation,
   releaseReservation,
+  clearRetryableFailedReservation,
 };

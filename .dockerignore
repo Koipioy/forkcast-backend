@@ -1,0 +1,26 @@
+# The worker image installs its own dependencies with `npm ci` from
+# package*.json. Copying the host's node_modules on top of that layer both
+# bloats the image and can smuggle in host-built or dev-only packages.
+node_modules
+**/node_modules
+
+# Version control and local state have no business in an image.
+.git
+.gitignore
+.firebase
+*.log
+**/*.log
+
+# Local environment files. Secrets come from Secret Manager at deploy time;
+# baking a .env into the image would defeat that entirely.
+.env
+**/.env
+.env.*
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+
+# The deploy directory itself is not needed inside the image.
+deploy

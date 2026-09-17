@@ -152,6 +152,36 @@ const MODEL_PRICING = {
     cachedInputMicrosPerMillion: 750_000,
     reasoningOutputMicrosPerMillion: 3_750_000,
   },
+  // Default model for direct YouTube recipe analysis. Cheapest current model
+  // that accepts video + audio and supports agentic video understanding; at
+  // high media resolution it costs about what 3.7 Flash costs at low, and
+  // the extra pixels go at reading on-screen ingredient text.
+  'google:gemini-3-5-flash-lite': {
+    provider: 'google',
+    model: 'gemini-3.5-flash-lite',
+    inputMicrosPerMillion: 300_000,
+    outputMicrosPerMillion: 2_500_000,
+    cachedInputMicrosPerMillion: 300_000,
+    reasoningOutputMicrosPerMillion: 2_500_000,
+  },
+  // Priced identically to 3.7 Flash. Present so switching
+    // GEMINI_DIRECT_YOUTUBE_MODEL does not fail on an unpriced model.
+  'google:gemini-3-6-flash': {
+    provider: 'google',
+    model: 'gemini-3.6-flash',
+    inputMicrosPerMillion: 750_000,
+    outputMicrosPerMillion: 3_750_000,
+    cachedInputMicrosPerMillion: 750_000,
+    reasoningOutputMicrosPerMillion: 3_750_000,
+  },
+  'google:gemini-3-8-flash': {
+    provider: 'google',
+    model: 'gemini-3.8-flash',
+    inputMicrosPerMillion: 750_000,
+    outputMicrosPerMillion: 3_750_000,
+    cachedInputMicrosPerMillion: 750_000,
+    reasoningOutputMicrosPerMillion: 3_750_000,
+  },
 };
 
 const DEFAULT_MODEL_ID = 'openai:gpt-5-6-luna';
@@ -212,6 +242,34 @@ const FEATURE_BILLING = {
     infraMicros: 50,
     maxInputTokens: 5_000,
     maxOutputTokens: 1_500,
+  },
+  /**
+   * Metadata-only media lookup. No model runs, so this is priced at the
+   * function-invocation level and is the cheapest step of the import ladder.
+   */
+  recipe_media_metadata: {
+    label: 'Recipe media lookup',
+    infraMicros: 150,
+    maxInputTokens: 1_000,
+    maxOutputTokens: 500,
+  },
+  /**
+   * Video analysis. The reserve is sized for the worst case the frame cap
+   * allows (MAX_FRAMES images plus a transcript) so the balance is held up
+   * front rather than discovered overrunning afterwards.
+   */
+  recipe_video_analysis: {
+    label: 'Recipe video analysis',
+    infraMicros: 900,
+    maxInputTokens: 60_000,
+    maxOutputTokens: 6_000,
+    imageReserveMicros: 40_000,
+  },
+  recipe_transcription: {
+    label: 'Recipe audio transcription',
+    infraMicros: 300,
+    maxInputTokens: 25_000,
+    maxOutputTokens: 8_000,
   },
   unknown: {
     label: 'AI operation',

@@ -148,42 +148,57 @@ function normalizeGoogleUsage(usageMetadata) {
   };
 }
 
-function buildOpenAIContent(prompt, image) {
-  if (!image) return prompt;
-  const mimeType = image.mimeType || 'image/jpeg';
+/**
+ * Normalise the single-image and many-images cases into one list.
+ *
+ * `image` is the original single-image contract every existing caller uses and
+ * is unchanged. `images` was added for the recipe video path, which sends a
+ * sampled frame set in one request - one call per frame would multiply the
+ * token bill by the frame count.
+ */
+function imageList(image, images) {
+  if (Array.isArray(images)) return images.filter((item) => item && item.base64);
+  if (image && image.base64) return [image];
+  return [];
+}
+
+function buildOpenAIContent(prompt, image, images) {
+  const list = imageList(image, images);
+  if (list.length === 0) return prompt;
   return [
     { type: 'text', text: prompt },
-    {
+    ...list.map((item) => ({
       type: 'image_url',
       image_url: {
-        url: `data:${mimeType};base64,${image.base64}`,
+        url: `data:${item.mimeType || 'image/jpeg'};base64,${item.base64}`,
       },
-    },
+    })),
   ];
 }
 
-function buildAnthropicContent(prompt, image) {
-  if (!image) return prompt;
+function buildAnthropicContent(prompt, image, images) {
+  const list = imageList(image, images);
+  if (list.length === 0) return prompt;
   return [
     { type: 'text', text: prompt },
-    {
+    ...list.map((item) => ({
       type: 'image',
       source: {
         type: 'base64',
-        media_type: image.mimeType || 'image/jpeg',
-        data: image.base64,
+        media_type: item.mimeType || 'image/jpeg',
+        data: item.base64,
       },
-    },
+    })),
   ];
 }
 
-function buildGoogleContent(prompt, image) {
+function buildGoogleContent(prompt, image, images) {
   const parts = [{ text: prompt }];
-  if (image) {
+  for (const item of imageList(image, images)) {
     parts.push({
       inlineData: {
-        mimeType: image.mimeType || 'image/jpeg',
-        data: image.base64,
+        mimeType: item.mimeType || 'image/jpeg',
+        data: item.base64,
       },
     });
   }
@@ -203,7 +218,7 @@ async function callOpenAI(prompt, model = null, options = {}) {
     messages: [
       {
         role: 'user',
-        content: buildOpenAIContent(prompt, options.image),
+        content: buildOpenAIContent(prompt, options.image, options.images),
       },
     ],
   };
@@ -252,7 +267,7 @@ async function callAnthropic(prompt, model, options = {}) {
       messages: [
         {
           role: 'user',
-          content: buildAnthropicContent(prompt, options.image),
+          content: buildAnthropicContent(prompt, options.image, options.images),
         },
       ],
     }),
@@ -309,7 +324,7 @@ async function callGoogle(prompt, model, options = {}) {
   );
 
   const body = {
-    contents: buildGoogleContent(prompt, options.image),
+    contents: buildGoogleContent(prompt, options.image, options.images),
   };
 
   if (options.maxTokens) {
@@ -371,7 +386,7 @@ async function callGoogle(prompt, model, options = {}) {
  * Routes to the selected provider, or infers the provider from the model name.
  *
  * @param {string} prompt
- * @param {{provider?: string, model?: string, image?: {base64: string, mimeType?: string}, maxTokens?: number}} options
+ * @param {{provider?: string, model?: string, image?: {base64: string, mimeType?: string}, images?: Array<{base64: string, mimeType?: string}>, maxTokens?: number}} options
  * @returns {Promise<{output: string, usage: object, providerRequestId: string|null, model: string, provider: string}>}
  */
 async function callLLMInternal(prompt, options = {}) {
@@ -402,8 +417,209 @@ async function callLLM(prompt, options = {}) {
   }
 }
 
+/**
+ * Providers that hold a usable API key right now.
+ */
+function providerHasKey(provider) {
+  if (provider === 'openai') return Boolean(getOpenAIKey());
+  if (provider === 'anthropic') return Boolean(getAnthropicKey());
+  if (provider === 'google') return Boolean(getGeminiKey());
+  return false;
+}
+
+/**
+ * Ordered catalog ids to try when the requested provider is unavailable.
+ *
+ * Ordered CHEAPEST FIRST on purpose. The caller reserved a max debit priced for
+ * the model the user actually asked for, and settleReservation caps the charge at
+ * that reservation. Falling back to something MORE expensive would silently move
+ * cost onto us, so every entry here costs no more than the models users select.
+ *
+ * Override with AI_FALLBACK_MODEL_IDS (comma-separated catalog ids).
+ */
+const DEFAULT_FALLBACK_MODEL_IDS = [
+  'openai:gpt-5-6-luna',
+  'google:gemini-3-5-flash-lite',
+  'google:gemini-3-6-flash',
+];
+
+function fallbackModelIds() {
+  const raw = process.env.AI_FALLBACK_MODEL_IDS;
+  if (!raw) return DEFAULT_FALLBACK_MODEL_IDS;
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Alternate provider/model pairs worth trying, cheapest first.
+ *
+ * Skips the pair that just failed, skips unpriced catalog entries (an unpriced
+ * model would blow up at settlement time with pricing_failed), and skips
+ * providers with no key configured.
+ */
+function getFallbackCandidates(excludeProvider, excludeModel) {
+  const { getModelPricing } = require('./billing/config');
+  const out = [];
+  for (const catalogId of fallbackModelIds()) {
+    let pricing = null;
+    try {
+      pricing = getModelPricing(catalogId);
+    } catch (_err) {
+      pricing = null;
+    }
+    if (!pricing || !pricing.provider || !pricing.model) continue;
+    if (pricing.provider === excludeProvider && pricing.model === excludeModel) continue;
+    if (!providerHasKey(pricing.provider)) continue;
+    out.push({ catalogId, provider: pricing.provider, model: pricing.model });
+  }
+  return out;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isTransientProviderError(err) {
+  const status = Number(err?.status || 0);
+  if (!status) return true; // network / unknown transport error
+  return status === 408 || status === 429 || status >= 500;
+}
+
+async function callLLMWithRetry(params, maxAttempts = 3) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await callLLM(params.prompt, params.options);
+    } catch (err) {
+      lastErr = err;
+      console.error('callLLMWithRetry attempt failed', {
+        attempt,
+        maxAttempts,
+        transient: isTransientProviderError(err),
+        message: err?.message || String(err),
+        status: err?.status || null,
+      });
+      if (!isTransientProviderError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+      await sleep(500 * attempt);
+    }
+  }
+  const err = new Error(
+    `LLM call failed: ${lastErr?.message || String(lastErr)}`,
+  );
+  err.cause = lastErr;
+  err.status = lastErr?.status || null;
+  throw err;
+}
+
+/**
+ * Call the LLM, and if the requested provider is unavailable, fall back to
+ * another configured provider instead of failing the user's request.
+ *
+ * Without this a single overloaded or quota-capped model takes down the whole
+ * product even when a perfectly good provider is sitting right there. That is
+ * exactly what happened when Gemini 3.7 Flash hit its free-tier ceiling: every
+ * recipe extraction failed although OpenAI was healthy.
+ *
+ * Only transient failures (408/429/5xx/transport) trigger a fallback. Auth and
+ * invalid-request errors are the caller's problem and propagate immediately.
+ *
+ * Returns the provider result annotated with fellBackFrom/fellBackTo so the
+ * response and the ledger show which model actually served the request.
+ */
+async function callLLMWithFallback(params, maxAttempts = 3, deps = {}) {
+  const retry = deps.callLLMWithRetry || callLLMWithRetry;
+  const candidatesFor = deps.getFallbackCandidates || getFallbackCandidates;
+  const primaryProvider = params.options?.provider || null;
+  const primaryModel = params.options?.model || null;
+
+  try {
+    return await retry(params, maxAttempts);
+  } catch (primaryErr) {
+    if (!isTransientProviderError(primaryErr)) {
+      throw primaryErr;
+    }
+
+    const candidates = candidatesFor(primaryProvider, primaryModel);
+    if (!candidates.length) {
+      console.error('AI provider unavailable and no fallback candidate configured', {
+        primaryProvider,
+        primaryModel,
+        status: primaryErr?.status || null,
+      });
+      throw primaryErr;
+    }
+
+    console.warn('Primary AI provider unavailable, trying fallbacks', {
+      primaryProvider,
+      primaryModel,
+      status: primaryErr?.status || null,
+      candidates: candidates.map((c) => c.catalogId),
+    });
+
+    for (const candidate of candidates) {
+      try {
+        const result = await retry(
+          {
+            prompt: params.prompt,
+            options: {
+              ...params.options,
+              provider: candidate.provider,
+              model: candidate.model,
+            },
+          },
+          maxAttempts,
+        );
+        console.warn('AI fallback served the request', {
+          fellBackFrom: `${primaryProvider}:${primaryModel}`,
+          fellBackTo: candidate.catalogId,
+        });
+        return {
+          ...result,
+          fellBackFrom: `${primaryProvider}:${primaryModel}`,
+          fellBackTo: candidate.catalogId,
+        };
+      } catch (fallbackErr) {
+        console.error('AI fallback candidate failed', {
+          candidate: candidate.catalogId,
+          transient: isTransientProviderError(fallbackErr),
+          message: fallbackErr?.message || String(fallbackErr),
+          status: fallbackErr?.status || null,
+        });
+        // Keep walking the chain. A dead provider (no credits, 400) must not
+        // stop us reaching the next one.
+      }
+    }
+
+    console.error('All AI fallback candidates failed, surfacing the original error', {
+      primaryProvider,
+      primaryModel,
+    });
+    throw primaryErr;
+  }
+}
+
+
 module.exports = {
   callLLM,
+  callLLMWithRetry,
+  callLLMWithFallback,
+  isTransientProviderError,
+  imageList,
+  providerHasKey,
+  fallbackModelIds,
+  getFallbackCandidates,
+  getOpenAIKey,
+  getOpenAIBaseUrl,
+  getAnthropicKey,
+  getAnthropicBaseUrl,
+  getGeminiKey,
+  getGeminiBaseUrl,
   callOpenAI,
   callAnthropic,
   callGoogle,

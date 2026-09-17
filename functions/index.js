@@ -19,7 +19,7 @@ const functions = require('firebase-functions/v1');
 
 const { db } = require('./firebase');
 const { getAuthenticatedUser } = require('./auth');
-const { callLLM } = require('./llm');
+const { callLLM, callLLMWithFallback, isTransientProviderError } = require('./llm');
 
 const {
   DEFAULT_MODEL_ID,
@@ -39,6 +39,7 @@ const {
 const {
   InsufficientBalanceError,
   claimReservation,
+  clearRetryableFailedReservation,
   releaseReservation,
   reserveBalance,
   settleReservation,
@@ -103,40 +104,6 @@ function methodNotAllowed(res) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isTransientProviderError(err) {
-  const status = Number(err?.status || 0);
-  if (!status) return true; // network / unknown transport error
-  return status === 408 || status === 429 || status >= 500;
-}
-
-async function callLLMWithRetry(params, maxAttempts = 3) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await callLLM(params.prompt, params.options);
-    } catch (err) {
-      lastErr = err;
-      console.error('callLLMWithRetry attempt failed', {
-        attempt,
-        maxAttempts,
-        transient: isTransientProviderError(err),
-        message: err?.message || String(err),
-        status: err?.status || null,
-      });
-      if (!isTransientProviderError(err) || attempt === maxAttempts) {
-        throw err;
-      }
-      await sleep(500 * attempt);
-    }
-  }
-  const err = new Error(
-    `LLM call failed: ${lastErr?.message || String(lastErr)}`,
-  );
-  err.cause = lastErr;
-  err.status = lastErr?.status || null;
-  throw err;
 }
 
 function normalizeModelSelection(body) {
@@ -300,6 +267,24 @@ async function runAIHandler(req, res, options = {}) {
     return;
   }
 
+  // 0. A previous attempt may have failed with zero charge (provider 503, empty
+  // output, pricing failure). operationIds are single-use, so without this every
+  // retry of that operation would answer 409 settled_without_result forever and
+  // the user could never retry a purely transient failure.
+  try {
+    const cleared = await clearRetryableFailedReservation(db, operationId);
+    if (cleared.cleared) {
+      console.warn('Cleared retryable failed reservation for retry', {
+        operationId,
+        feature,
+      });
+    }
+  } catch (err) {
+    // Never block a fresh request on cleanup. If this fails the caller sees the
+    // original settled_without_result 409 rather than a new failure mode.
+    console.error('Failed to clear retryable failed reservation', err);
+  }
+
   // 1. Reserve balance.
   let reservationResult = null;
   try {
@@ -445,7 +430,7 @@ async function runAIHandler(req, res, options = {}) {
   const prompt = text || 'Analyze the provided image.';
   let providerResult = null;
   try {
-    providerResult = await callLLMWithRetry(
+    providerResult = await callLLMWithFallback(
       {
         prompt,
         options: {
@@ -531,7 +516,7 @@ async function runAIHandler(req, res, options = {}) {
           provider: providerResult?.provider || pricing.provider,
           model: providerResult?.model || pricing.model,
           functionName: 'runAI',
-          metadata: { emptyOutput: true },
+          metadata: { emptyOutput: true, failure: true },
         }),
       );
     } catch (settleErr) {
@@ -578,7 +563,7 @@ async function runAIHandler(req, res, options = {}) {
           provider: providerResult.provider,
           model: providerResult.model,
           functionName: 'runAI',
-          metadata: { pricingError: err?.message || 'pricing_error' },
+          metadata: { pricingError: err?.message || 'pricing_error', failure: true },
         }),
       );
     } catch (settleErr) {
@@ -858,6 +843,304 @@ exports.topupOptions = functions.https.onRequest(async (req, res) => {
 });
 
 /**
+ * ---------------------------------------------------------------------------
+ * Recipe import from URLs (webpage, YouTube, Instagram, TikTok, Pinterest, ...)
+ * ---------------------------------------------------------------------------
+ *
+ * The client never has to know what kind of link it pasted. It asks for cheap
+ * metadata first, and only creates a job when it has decided the text it
+ * already has is not enough. The heavy work - yt-dlp, ffmpeg, a video model -
+ * happens in the Firestore-triggered background function below, never inside a
+ * request the client is waiting on.
+ */
+
+const recipeImport = require('./recipeImport');
+const {
+  JOB_STATUS,
+  claimJob,
+  createJob,
+  deleteExpiredJobs,
+  getJobForUser,
+} = recipeImport.jobStore;
+const { collectMediaEvidence } = recipeImport.service;
+const { guardUrl } = recipeImport.urlGuard;
+const { runWorkerJob } = require('./recipeImport/workerRuntime');
+const { dispatchJobToCloudRun } = require('./recipeImport/cloudRun/dispatcher');
+
+/**
+ * POST /resolveMediaMetadata
+ *
+ * Cheap probe: platform, title, caption/description, duration. Runs with
+ * --no-download, so no video bytes move and no model is called.
+ */
+exports.resolveMediaMetadata = functions
+  .runWith({ secrets: AI_SECRETS, timeoutSeconds: 60 })
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+    if (req.method !== 'POST') {
+      methodNotAllowed(res);
+      return;
+    }
+
+    let authResult = null;
+    try {
+      authResult = await getAuthenticatedUser(req);
+    } catch (_err) {
+      unauthorized(res);
+      return;
+    }
+
+    const rawUrl = String(req.body?.url || '').trim();
+    if (!rawUrl) {
+      badRequest(res, 'url is required', 'missing_url');
+      return;
+    }
+
+    try {
+      await guardUrl(rawUrl);
+      const result = await collectMediaEvidence(rawUrl);
+      sendJson(res, 200, {
+        success: true,
+        media: {
+          originalUrl: result.media.originalUrl,
+          platform: result.media.platform,
+          title: result.media.title,
+          description: result.media.description,
+          uploader: result.media.uploader,
+          durationSeconds: result.media.durationSeconds,
+          thumbnail: result.media.thumbnail,
+          isVideo: result.media.isVideo,
+          mediaType: result.media.mediaType,
+        },
+        evidence: result.evidence,
+      });
+    } catch (err) {
+      const typed = recipeImport.toRecipeImportError(err);
+      const statusByCode = {
+        UNSAFE_URL: 400,
+        INVALID_URL: 400,
+        MEDIA_RESOLUTION_FAILED: 422,
+        MEDIA_METADATA_TIMEOUT: 504,
+        MEDIA_TOOLING_UNAVAILABLE: 503,
+      };
+      sendJson(res, statusByCode[typed.code] || 500, {
+        success: false,
+        error: typed.message,
+        code: typed.code,
+        retryable: typed.retryable,
+      });
+    }
+  });
+
+/**
+ * POST /createRecipeImportJob
+ *
+ * Queues the heavy path. Returns immediately with a job id; the client polls
+ * /recipeImportJob.
+ */
+exports.createRecipeImportJob = functions
+  .runWith({ secrets: AI_SECRETS })
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+    if (req.method !== 'POST') {
+      methodNotAllowed(res);
+      return;
+    }
+
+    let authResult = null;
+    try {
+      authResult = await getAuthenticatedUser(req);
+    } catch (_err) {
+      unauthorized(res);
+      return;
+    }
+
+    if (!recipeImport.config.RECIPE_IMPORT_ENABLED) {
+      sendJson(res, 503, {
+        success: false,
+        error: 'Recipe import is disabled.',
+        code: 'FEATURE_DISABLED',
+      });
+      return;
+    }
+
+    const rawUrl = String(req.body?.url || '').trim();
+    if (!rawUrl) {
+      badRequest(res, 'url is required', 'missing_url');
+      return;
+    }
+
+    try {
+      await guardUrl(rawUrl);
+    } catch (err) {
+      const typed = recipeImport.toRecipeImportError(err);
+      sendJson(res, 400, {
+        success: false,
+        error: typed.message,
+        code: typed.code,
+      });
+      return;
+    }
+
+    try {
+      const job = await createJob(db, {
+        uid: authResult.uid,
+        url: rawUrl,
+        pageText: req.body?.pageText ?? null,
+        caption: req.body?.caption ?? null,
+        structuredRecipe: req.body?.structuredRecipe ?? null,
+        skipSufficiencyCheck: req.body?.skipSufficiencyCheck ?? true,
+        provider: req.body?.provider ?? null,
+        model: req.body?.model ?? null,
+      });
+
+      // Hand the job to the Cloud Run worker, which is the thing that
+      // actually has yt-dlp and ffmpeg. The client does not wait on it - it
+      // polls Firestore, which the worker writes to. If the dispatch fails
+      // and the Firestore trigger is still enabled, the trigger picks the job
+      // up regardless, so a cold start or a bad worker URL slows imports
+      // down rather than stopping them.
+      const dispatch = await dispatchJobToCloudRun({ jobId: job.id, url: rawUrl, db });
+
+      sendJson(res, 200, {
+        success: true,
+        jobId: job.id,
+        status: job.status,
+        dispatched: dispatch.dispatched,
+      });
+    } catch (err) {
+      console.error('createRecipeImportJob failed', err);
+      sendJson(res, 500, {
+        success: false,
+        error: 'Could not create the recipe import job.',
+        code: 'job_create_failed',
+      });
+    }
+  });
+
+/**
+ * GET /recipeImportJob?jobId=...
+ *
+ * Poll target. Only the owning user can read their job.
+ */
+exports.recipeImportJob = functions.https.onRequest(async (req, res) => {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  let authResult = null;
+  try {
+    authResult = await getAuthenticatedUser(req);
+  } catch (_err) {
+    unauthorized(res);
+    return;
+  }
+
+  const jobId = String(req.query?.jobId || '').trim();
+  if (!jobId) {
+    badRequest(res, 'jobId is required', 'missing_job_id');
+    return;
+  }
+
+  try {
+    const job = await getJobForUser(db, jobId, authResult.uid);
+    sendJson(res, 200, {
+      success: true,
+      job: {
+        id: job.id,
+        status: job.status,
+        stage: job.stage,
+        createdAt: job.createdAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+        result: job.status === JOB_STATUS.SUCCEEDED ? job.result : null,
+        error: job.status === JOB_STATUS.FAILED ? job.error : null,
+      },
+    });
+  } catch (err) {
+    const typed = recipeImport.toRecipeImportError(err);
+    if (typed.code === 'JOB_NOT_FOUND') {
+      sendJson(res, 404, { success: false, error: 'Job not found.', code: typed.code });
+      return;
+    }
+    console.error('recipeImportJob failed', err);
+    sendJson(res, 500, {
+      success: false,
+      error: 'Could not load the job.',
+      code: 'job_read_failed',
+    });
+  }
+});
+
+/**
+ * Background worker.
+ *
+ * A Firestore-triggered background function rather than a synchronous callable:
+ * a video import can run for minutes, and holding a client socket that long is
+ * how timeouts and double-charges get invented.
+ *
+ * Sizing, and why:
+ *   memory 1GB     - ffmpeg frame buffers plus the Node heap for base64 frames.
+ *                    512MB OOMs on a 60-frame set at 640px wide.
+ *   timeout 540s   - the 1st-gen ceiling. Covers a 200MB download at a
+ *                    conservative 1.5MB/s, plus preprocessing, plus one model
+ *                    call, with headroom.
+ *   maxInstances 2 - yt-dlp and ffmpeg are CPU and disk bound and this is an
+ *                    escalation path, not the default route. Two instances is
+ *                    enough for launch without an unbounded bill.
+ *   concurrency    - not configurable on background functions (one per
+ *                    instance), which is exactly what we want here; the
+ *                    in-process guard in worker.js enforces it too.
+ */
+exports.processRecipeImportJobTrigger = functions
+  .runWith({
+    memory: recipeImport.config.WORKER_MEMORY,
+    timeoutSeconds: recipeImport.config.WORKER_TIMEOUT_SECONDS,
+    maxInstances: recipeImport.config.WORKER_MAX_INSTANCES,
+    secrets: AI_SECRETS,
+  })
+  .firestore.document(`${recipeImport.config.JOB_COLLECTION}/{jobId}`)
+  .onCreate(async (snapshot, context) => {
+    const jobId = context.params.jobId;
+
+    // This trigger is the fallback, not the primary route. When a Cloud Run
+    // worker is configured and the trigger is switched off, the worker owns
+    // the job and running it here too would mean two copies of ffmpeg on two
+    // runtimes for one import.
+    if (
+      require('./recipeImport/cloudRun/dispatcher').isWorkerConfigured() &&
+      !recipeImport.config.WORKER_FIRESTORE_TRIGGER_ENABLED
+    ) {
+      console.log('recipe import trigger skipped: Cloud Run worker owns this job', {
+        jobId,
+      });
+      return;
+    }
+
+    try {
+      await runWorkerJob(db, jobId);
+    } catch (err) {
+      // The job document already carries the typed failure; a throw here would
+      // only make Firestore retry a job that has already been marked failed.
+      console.error('recipe import worker failed', {
+        jobId,
+        code: err?.code || 'INTERNAL_ERROR',
+        message: err?.message,
+      });
+    }
+  });
+
+/**
  * Scheduled cleanup for stale reservations.
  */
 exports.releaseExpiredReservations = functions.pubsub
@@ -868,6 +1151,18 @@ exports.releaseExpiredReservations = functions.pubsub
       console.log('releaseExpiredReservations completed', result);
     } catch (err) {
       console.error('releaseExpiredReservations failed', err);
+    }
+    try {
+      const expired = await deleteExpiredJobs(db, 100);
+      console.log('deleteExpiredJobs completed', expired);
+    } catch (err) {
+      console.error('deleteExpiredJobs failed', err);
+    }
+    try {
+      const cache = await recipeImport.evidenceCache.deleteExpiredCacheEntries(db, 200);
+      console.log('deleteExpiredCacheEntries completed', cache);
+    } catch (err) {
+      console.error('deleteExpiredCacheEntries failed', err);
     }
   });
 
