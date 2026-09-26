@@ -937,6 +937,93 @@ exports.resolveMediaMetadata = functions
   });
 
 /**
+ * POST /transcribeLocalAudio
+ *
+ * The device captured an audio window with `captureStream()` inside the
+ * import WebView. Send it to the same Whisper endpoint the cloud worker
+ * uses and hand back plain text.
+ *
+ * This is the audio leg the spike proved end to end: record a window off
+ * the element's own audio track, transcribe it through
+ * `/audio/transcriptions`, land the text in the prompt under its own
+ * header. Before this existed the app recorded audio and had nowhere to
+ * send it, so every captured window was bytes paid for and thrown away.
+ *
+ * Body: { audioBase64, mimeType?, startSeconds?, endSeconds? }
+ *   - mimeType matters. The recorder reports what the engine chose,
+ *     typically `audio/webm;codecs=opus`. Assuming `audio/mpeg` for a
+ *     webm is how you get an empty transcript from a file full of speech.
+ *
+ * Response: { success, text, language, durationSeconds, model }
+ */
+const MAX_LOCAL_AUDIO_BASE64_CHARS = 12_000_000; // ~9 MB of raw audio
+
+exports.transcribeLocalAudio = functions
+  .runWith({ secrets: AI_SECRETS, timeoutSeconds: 120 })
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+    if (req.method !== 'POST') {
+      methodNotAllowed(res);
+      return;
+    }
+
+    let authResult = null;
+    try {
+      authResult = await getAuthenticatedUser(req);
+    } catch (_err) {
+      unauthorized(res);
+      return;
+    }
+
+    const audioBase64 = String(req.body?.audioBase64 || '');
+    if (!audioBase64) {
+      badRequest(res, 'audioBase64 is required', 'missing_audio');
+      return;
+    }
+    if (audioBase64.length > MAX_LOCAL_AUDIO_BASE64_CHARS) {
+      badRequest(res, 'Audio window is too large', 'audio_too_large');
+      return;
+    }
+
+    try {
+      const { transcribeBase64 } = require('./recipeImport/analyzers/transcribe');
+      const result = await transcribeBase64({
+        audioBase64,
+        mimeType: req.body?.mimeType ? String(req.body.mimeType) : undefined,
+      });
+      sendJson(res, 200, {
+        success: true,
+        text: result.text,
+        language: result.language ?? null,
+        durationSeconds: result.durationSeconds ?? null,
+        model: result.model ?? null,
+        startSeconds: Number.isFinite(Number(req.body?.startSeconds))
+          ? Number(req.body.startSeconds)
+          : null,
+        endSeconds: Number.isFinite(Number(req.body?.endSeconds))
+          ? Number(req.body.endSeconds)
+          : null,
+      });
+    } catch (err) {
+      const typed = recipeImport.toRecipeImportError(err);
+      const statusByCode = {
+        PROVIDER_UNAVAILABLE: 503,
+        TRANSCRIPTION_FAILED: 422,
+      };
+      sendJson(res, statusByCode[typed.code] || 500, {
+        success: false,
+        error: typed.message,
+        code: typed.code,
+        retryable: typed.retryable,
+      });
+    }
+  });
+
+/**
  * POST /createRecipeImportJob
  *
  * Queues the heavy path. Returns immediately with a job id; the client polls
