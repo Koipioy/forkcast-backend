@@ -656,6 +656,59 @@ async function extractRecipeFromUrl(url, options = {}) {
   const jobId = options.jobId || 'inline';
   const callerBundle = seedEvidenceFromCaller(url, options);
 
+  // Ask the cheap question before paying for the expensive one.
+  //
+  // The resolver below spawns yt-dlp and makes a network round trip to find
+  // out whether this URL carries a video. A blog post that already handed us
+  // its whole recipe in scraped page text never needs that answer, but until
+  // now it paid for it anyway: a process spawn and a round trip on every
+  // text-only import, and on a deployment without the binary a
+  // MEDIA_METADATA_FAILED line every time, which is noise that buries the
+  // alarms that matter.
+  //
+  // Only the caller's own text is weighed here. If it falls short we fall
+  // straight through and probe exactly as before, so a YouTube page whose
+  // description is what makes it sufficient still gets that description, and
+  // no escalation path changes behaviour.
+  if (!options.videoFile && !options.skipSufficiencyCheck) {
+    const callerSufficiency = assessTextSufficiency(
+      {
+        title: options.structuredRecipe?.title || null,
+        text: [options.pageText || '', options.caption || ''].filter(Boolean).join('\n\n'),
+        structuredRecipe: options.structuredRecipe,
+      },
+      options.sufficiency,
+    );
+
+    if (callerSufficiency.sufficient) {
+      logger.info(STAGES.TEXT_RECIPE_SUFFICIENT, {
+        jobId,
+        url,
+        score: callerSufficiency.score,
+        missing: callerSufficiency.missing,
+        platform: null,
+        isVideo: false,
+        mediaProbeSkipped: true,
+      });
+      logger.info(STAGES.TEXT_ONLY_SUCCESS, {
+        jobId,
+        url,
+        platform: null,
+        score: callerSufficiency.score,
+        evidence: summarizeEvidence(callerBundle),
+        mediaProbeSkipped: true,
+      });
+      return {
+        escalated: false,
+        evidence: callerBundle,
+        media: null,
+        sufficiency: callerSufficiency,
+        videoResult: null,
+        mediaProbeSkipped: true,
+      };
+    }
+  }
+
   let media = null;
   // Recorded rather than logged immediately. Whether a missing binary matters
   // depends on something we do not know yet: whether the text turns out to be
